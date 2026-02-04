@@ -277,7 +277,11 @@ for (yy in years) {
       "  ", out_tot_rds, "\n",
       "  ", qc_report, "\n\n", file=qc_report, append=TRUE)
 
-  cat("Saved:\n  ", out_coarse, "\n  ", out_down, "\n")
+  cat("Saved:\n",
+    "  ", out_coarse, " | exists=", file.exists(out_coarse), "\n",
+    "  ", out_down,   " | exists=", file.exists(out_down), "\n",
+    "  ", out_tot_rds," | exists=", file.exists(out_tot_rds), "\n",
+    "  ", qc_report,  " | exists=", file.exists(qc_report), "\n", sep="")
   rm(nrd, onr, pm_nrd, pm_onr, tot, r_tot, tot_on_1km, down_1km, down_back_12km, diff_r); gc()
 }
 
