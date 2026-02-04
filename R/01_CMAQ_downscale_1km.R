@@ -1,245 +1,253 @@
 # ============================================================
-# CMAQ annual mean (2011-2020) + optional downscale to roadiness
-# Author: (for Sherry)
+# CMAQ (hr2day_w_organics) Annual (2011–2020) + 1km Downscaling
+# Variables: PM25_TOT_ONR, PM25_TOT_NRD
+# Dependencies: raster, ncdf4, data.table
+# Output: GeoTIFFs in /scratch/xshan2/R_Code/disperseR/Auto
 # ============================================================
 
+rm(list = ls())
+
 suppressPackageStartupMessages({
-  library(terra)
-  library(stringr)
+  library(raster)
+  library(ncdf4)
   library(data.table)
 })
 
 # -----------------------------
-# 0) USER SETTINGS
+# USER SETTINGS
 # -----------------------------
-post_dir <- "/home/xshan2/HAQ_LAB/Sumaiya/cmaq/cmaq_output/POST"
-
-# Choose which CMAQ post-processed file family to use
-# Typical: hr2day_*.nc (daily mean surface) or COMBINE_ACONC_*.nc (hourly, huge)
-# Strongly recommended: hr2day
-prefer_pattern <- "hr2day"     # change if your filenames differ
-
-# Target variable name inside netCDF (try this first)
-var_prefer <- "PM25_TOT"       # you can change to PM25, PM25_TOT_ONR, etc.
-
-# Output folders
-out_dir_annual <- file.path(post_dir, "ANNUAL_PM25")
-dir.create(out_dir_annual, showWarnings = FALSE, recursive = TRUE)
-
-# Optional: downscale to roadiness (set to FALSE if you only want annual CMAQ)
-do_downscale <- TRUE
-
-# Your roadiness raster paths (choose 1km or 500m; you can run twice)
-roadiness_path <- "/home/xshan2/your_path/roadiness_1km.tif"   # <-- CHANGE THIS
-# roadiness_path <- "/home/xshan2/your_path/roadiness_500m.tif" # <-- OR THIS
-
-out_dir_downscaled <- file.path(post_dir, "DOWNSCALED_PM25")
-dir.create(out_dir_downscaled, showWarnings = FALSE, recursive = TRUE)
-
-# Years to process
 years <- 2011:2020
 
+# CMAQ hr2day_w_organics directory (copied to your scratch)
+post_dir <- "/scratch/xshan2/cmaq_POST"
+
+# Output directory
+out_dir <- "/scratch/xshan2/R_Code/disperseR/Auto"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Projection (match your roadiness)
+p4s <- "+proj=lcc +lat_1=33 +lat_2=45 +lat_0=40 +lon_0=-97 +a=6370000 +b=6370000 +units=m +no_defs"
+
+# CMAQ grid resolution (12 km)
+cmaq_res <- 12000
+
+# Roadiness CSV (1km)
+road_csv <- "/scratch/xshan2/R_Code/disperseR/Auto/roadiness_2017/roadiness_1km_hw_loc_sherry.csv"
+
+# Choose which normalized roadiness weight to use
+road_weight_col <- "leng.distm2_hw_norm"   # highway
+# road_weight_col <- "leng.distm2_loc_norm"  # local
+
+# Tag used in output filenames
+tag <- "hw"  # "hw" or "loc"
+
+# CMAQ variables to process
+vars <- c("PM25_TOT_ONR", "PM25_TOT_NRD")
+
+# Save 12km annual rasters too?
+save_coarse_annual <- TRUE
+
 # -----------------------------
-# 1) HELPERS
+# HELPERS
 # -----------------------------
-
-# Try to open a netCDF variable as a SpatRaster
-open_cmaq_var <- function(nc_file, var_prefer = "PM25_TOT") {
-  # Some netCDFs contain subdatasets; terra::sds() lists them
-  s <- try(terra::sds(nc_file), silent = TRUE)
-
-  if (!inherits(s, "try-error")) {
-    subnames <- names(s)
-
-    # 1) exact match
-    if (var_prefer %in% subnames) return(rast(s[var_prefer]))
-
-    # 2) heuristic match: contains PM25 and TOT or just PM25
-    cand <- subnames[str_detect(subnames, regex("PM\\s*25|PM25", ignore_case = TRUE))]
-    if (length(cand) > 0) {
-      # prefer something like TOT
-      cand2 <- cand[str_detect(cand, regex("TOT", ignore_case = TRUE))]
-      pick <- if (length(cand2) > 0) cand2[1] else cand[1]
-      message("  [var auto-pick] Using variable: ", pick)
-      return(rast(s[pick]))
-    }
-
-    # 3) If none found, show variables
-    stop("No PM2.5-like variable found. Available variables:\n  - ",
-         paste(subnames, collapse = "\n  - "))
-  }
-
-  # Fallback: try direct open (works if file is simple)
-  r <- try(rast(nc_file, subds = var_prefer), silent = TRUE)
-  if (!inherits(r, "try-error")) return(r)
-
-  stop("Could not open netCDF with terra. File: ", nc_file)
-}
-
-# Parse year-month from filename (robust-ish)
-# Looks for YYYYMM or YYYY-MM in filename
-parse_ym_from_filename <- function(f) {
+parse_ym <- function(f) {
   bn <- basename(f)
-  # try YYYYMM
-  m1 <- str_match(bn, "(20\\d{2})(0[1-9]|1[0-2])")
-  if (!is.na(m1[1,1])) return(list(year = as.integer(m1[1,2]), month = as.integer(m1[1,3])))
-
-  # try YYYY-MM
-  m2 <- str_match(bn, "(20\\d{2})[-_](0[1-9]|1[0-2])")
-  if (!is.na(m2[1,1])) return(list(year = as.integer(m2[1,2]), month = as.integer(m2[1,3])))
-
-  # try YYYY_Mon (rare)
+  m <- regexpr("(20[0-9][0-9])(0[1-9]|1[0-2])", bn, perl = TRUE)
+  if (m[1] != -1) {
+    s <- regmatches(bn, m)
+    return(list(year = as.integer(substr(s, 1, 4)),
+                month = as.integer(substr(s, 5, 6))))
+  }
   stop("Cannot parse year/month from filename: ", bn)
 }
 
-days_in_month <- function(year, month) {
-  # month 1..12
-  start <- as.Date(sprintf("%04d-%02d-01", year, month))
-  end <- if (month == 12) as.Date(sprintf("%04d-01-01", year + 1)) else as.Date(sprintf("%04d-%02d-01", year, month + 1))
-  as.integer(end - start)
-}
-
-# Annual mean from monthly files (weighted by days)
-compute_annual_from_monthlies <- function(files, year, var_prefer) {
-  if (length(files) == 0) stop("No monthly files found for year ", year)
-
-  sum_r <- NULL
-  total_days <- 0L
-
-  for (f in files) {
-    ym <- parse_ym_from_filename(f)
-    nd <- days_in_month(ym$year, ym$month)
-
-    message(sprintf("  -> %s (days=%d)", basename(f), nd))
-    r <- open_cmaq_var(f, var_prefer = var_prefer)
-
-    # If hr2day: usually many layers (days). We need monthly mean across time layers
-    # terra::app streams; no need to load entire cube
-    r_month_mean <- app(r, fun = mean, na.rm = TRUE)
-
-    if (is.null(sum_r)) {
-      sum_r <- r_month_mean * nd
-    } else {
-      # Align if needed
-      if (!compareGeom(sum_r, r_month_mean, stopOnError = FALSE)) {
-        r_month_mean <- resample(r_month_mean, sum_r, method = "near")
-      }
-      sum_r <- sum_r + (r_month_mean * nd)
-    }
-    total_days <- total_days + nd
+days_in_month <- function(y, m) {
+  if (m == 12) {
+    d1 <- as.Date(sprintf("%04d-12-01", y))
+    d2 <- as.Date(sprintf("%04d-01-01", y + 1))
+  } else {
+    d1 <- as.Date(sprintf("%04d-%02d-01", y, m))
+    d2 <- as.Date(sprintf("%04d-%02d-01", y, m + 1))
   }
-
-  annual <- sum_r / total_days
-  names(annual) <- paste0("PM25_annual_", year)
-  annual
+  as.integer(d2 - d1)
 }
 
-# Mean-preserving downscale to a finer roadiness grid (approx mass/mean preserved per CMAQ cell)
-downscale_mean_preserving <- function(cmaq_annual, road_fine) {
-  # Reproject roadiness to CMAQ CRS (or CMAQ to roadiness). We do everything in roadiness CRS to output fine grid.
-  # Step 1: project CMAQ annual to road CRS but keep coarse cell values (nearest)
-  cmaq_in_road_crs <- project(cmaq_annual, crs(road_fine), method = "near")
-
-  # Step 2: assign each fine cell the coarse CMAQ value (nearest)
-  cmaq_on_fine <- resample(cmaq_in_road_crs, road_fine, method = "near")
-
-  # Step 3: compute coarse-cell mean roadiness (on the projected CMAQ grid)
-  road_on_coarse <- resample(road_fine, cmaq_in_road_crs, method = "bilinear")  # average-ish proxy
-
-  # Avoid division by zero / NA: set very small epsilon
-  eps <- 1e-12
-  road_on_coarse[is.na(road_on_coarse)] <- 0
-  road_fine2 <- road_fine
-  road_fine2[is.na(road_fine2)] <- 0
-
-  # Step 4: bring coarse mean roadiness back to fine grid (nearest)
-  road_mean_on_fine <- resample(road_on_coarse, road_fine2, method = "near")
-
-  # Step 5: mean-preserving factor within each coarse cell:
-  # factor = road_fine / mean_road_coarse
-  # when mean_road_coarse == 0, set factor = 1 (no modulation)
-  denom <- road_mean_on_fine
-  denom[denom < eps] <- NA
-  factor <- road_fine2 / denom
-  factor[is.na(factor)] <- 1
-
-  # Step 6: downscaled concentration
-  down <- cmaq_on_fine * factor
-  down
+require_var <- function(nc, v) {
+  vnames <- names(nc$var)
+  if (!(v %in% vnames)) {
+    stop("Variable not found: ", v, "\nAvailable vars include:\n  - ",
+         paste(vnames, collapse = "\n  - "))
+  }
+  v
 }
 
-# -----------------------------
-# 2) FIND CMAQ FILES
-# -----------------------------
-all_nc <- list.files(post_dir, pattern = "\\.nc$", full.names = TRUE, recursive = TRUE)
+# ============================================================
+# 0) READ ROADINESS -> 1km RASTER TEMPLATE
+# ============================================================
+cat("Reading roadiness CSV:\n  ", road_csv, "\n")
 
-# Keep only preferred family (e.g., hr2day)
-cands <- all_nc[str_detect(tolower(basename(all_nc)), tolower(prefer_pattern))]
+road_dt <- fread(road_csv)
+cn <- names(road_dt)
 
-if (length(cands) == 0) {
-  stop("No netCDF files found matching pattern '", prefer_pattern, "' under:\n  ", post_dir)
-}
+xcol <- if ("x" %in% cn) "x" else if ("X" %in% cn) "X" else stop("No x column in roadiness CSV")
+ycol <- if ("y" %in% cn) "y" else if ("Y" %in% cn) "Y" else stop("No y column in roadiness CSV")
+stopifnot(road_weight_col %in% cn)
 
-# Build table with parsed year/month
-meta <- rbindlist(lapply(cands, function(f) {
-  ym <- try(parse_ym_from_filename(f), silent = TRUE)
+# Keep only what we need (reduces memory)
+road_dt <- road_dt[, .(x = get(xcol), y = get(ycol), w = get(road_weight_col))]
+road_dt[!is.finite(w) | is.na(w), w := 0]
+
+road_r <- rasterFromXYZ(as.data.frame(road_dt), crs = CRS(p4s))
+names(road_r) <- paste0("road_", tag)
+
+cat("\n[Roadiness raster template]\n")
+print(road_r)
+
+# Aggregation factor (12km / 1km = 12)
+fact <- round(cmaq_res / res(road_r)[1])
+if (!is.finite(fact) || fact < 1) stop("Bad aggregation factor. Check roadiness resolution.")
+cat("\nAggregation factor (coarse/fine): ", fact, "\n")
+
+# Precompute 12km mean roadiness on the roadiness-anchored grid
+road_mean_12km <- aggregate(road_r, fact = fact, fun = mean, na.rm = TRUE)
+
+# Anchoring: we will build all CMAQ rasters using roadiness xmin/ymin as the origin
+ex_road <- extent(road_r)
+
+# ============================================================
+# 1) INDEX CMAQ FILES
+# ============================================================
+cat("\nIndexing CMAQ files under:\n  ", post_dir, "\n")
+nc_files <- list.files(post_dir, pattern = "hr2day_w_organics.*\\.nc$", full.names = TRUE, recursive = TRUE)
+if (length(nc_files) == 0) stop("No hr2day_w_organics netCDF files found under post_dir.")
+
+meta <- rbindlist(lapply(nc_files, function(f) {
+  ym <- try(parse_ym(f), silent = TRUE)
   if (inherits(ym, "try-error")) return(NULL)
-  data.table(file = f, year = ym$year, month = ym$month)
+  data.table(file = f, year = ym$year, month = ym$month, base = basename(f))
 }), fill = TRUE)
 
 meta <- meta[year %in% years]
+setorder(meta, year, month, base)
+
+cat("\nFiles found per year (before de-dup):\n")
+print(meta[, .N, by = year])
+
+# De-duplicate: if a year-month has multiple files, keep the first by filename
+meta <- meta[, .SD[1], by = .(year, month)]
 setorder(meta, year, month)
 
-if (nrow(meta) == 0) stop("No files after filtering to years: ", paste(years, collapse = ","))
+cat("\nFiles used per year (after de-dup by year-month):\n")
+print(meta[, .N, by = year])
 
-message("Found files by year:\n", capture.output(print(meta[, .N, by = year])))
-
-# -----------------------------
-# 3) COMPUTE ANNUAL CMAQ
-# -----------------------------
-annual_files <- list()
-
+# ============================================================
+# 2) MAIN LOOP: YEARS x VARS
+# ============================================================
 for (yy in years) {
-  message("\n==============================")
-  message("Computing annual mean for year: ", yy)
-  message("==============================")
 
-  files_y <- meta[year == yy][order(month)]$file
-  if (length(files_y) == 0) {
-    message("  [skip] No files for ", yy)
+  files_y <- meta[year == yy]
+  if (nrow(files_y) == 0) {
+    cat("\n[SKIP] No files found for year:", yy, "\n")
     next
   }
 
-  r_annual <- compute_annual_from_monthlies(files_y, year = yy, var_prefer = var_prefer)
+  if (nrow(files_y) < 12) {
+    warning("Year ", yy, " has only ", nrow(files_y), " months (expected 12). Continuing anyway.")
+  }
 
-  out_tif <- file.path(out_dir_annual, sprintf("CMAQ_%s_annual_%d.tif", var_prefer, yy))
-  writeRaster(r_annual, out_tif, overwrite = TRUE)
-  message("  [saved] ", out_tif)
+  cat("\n========================================\n")
+  cat("YEAR:", yy, "| months:", paste(sprintf("%02d", files_y$month), collapse = ","), "\n")
+  cat("========================================\n")
 
-  annual_files[[as.character(yy)]] <- out_tif
-}
+  for (v in vars) {
 
-# -----------------------------
-# 4) OPTIONAL: DOWNSCALE TO ROADINESS (1km or 500m)
-# -----------------------------
-if (do_downscale) {
-  message("\nLoading roadiness raster: ", roadiness_path)
-  road <- rast(roadiness_path)
+    cat("\n  ---- Processing variable:", v, "----\n")
 
-  for (yy in names(annual_files)) {
-    message("\n------------------------------")
-    message("Downscaling year: ", yy)
-    message("------------------------------")
+    sum_mat <- NULL
+    tot_days <- 0L
+    ncol_cmaq <- NULL
+    nrow_cmaq <- NULL
 
-    cmaq_annual <- rast(annual_files[[yy]])
+    for (i in 1:nrow(files_y)) {
+      f  <- files_y$file[i]
+      mo <- files_y$month[i]
+      nd <- days_in_month(yy, mo)
 
-    down <- downscale_mean_preserving(cmaq_annual, road)
-    names(down) <- paste0("PM25_downscaled_", yy)
+      cat("    Month", sprintf("%02d", mo), "| days =", nd, "|", basename(f), "\n")
 
-    out_tif2 <- file.path(out_dir_downscaled, sprintf("CMAQ_%s_downscaled_%s.tif", var_prefer, yy))
-    writeRaster(down, out_tif2, overwrite = TRUE)
-    message("  [saved] ", out_tif2)
+      nc <- nc_open(f)
+      vv <- require_var(nc, v)
+      pm <- ncvar_get(nc, vv)
+      nc_close(nc)
+
+      # dims: [COL, ROW, T] or [COL, ROW, LAY, T]
+      if (length(dim(pm)) == 4) pm <- pm[, , 1, ]  # surface layer
+
+      # Monthly mean over time dimension
+      pm_mean <- apply(pm, c(1, 2), mean, na.rm = TRUE)
+
+      if (is.null(sum_mat)) {
+        sum_mat <- pm_mean * nd
+        ncol_cmaq <- dim(pm_mean)[1]
+        nrow_cmaq <- dim(pm_mean)[2]
+      } else {
+        sum_mat <- sum_mat + pm_mean * nd
+      }
+
+      tot_days <- tot_days + nd
+    }
+
+    pm_annual <- sum_mat / tot_days
+
+    # Build 12km annual raster anchored to roadiness xmin/ymin
+    r_cmaq <- raster(
+      nrows = nrow_cmaq,
+      ncols = ncol_cmaq,
+      xmn = ex_road@xmin,
+      xmx = ex_road@xmin + ncol_cmaq * cmaq_res,
+      ymn = ex_road@ymin,
+      ymx = ex_road@ymin + nrow_cmaq * cmaq_res,
+      crs = CRS(p4s)
+    )
+
+    values(r_cmaq) <- as.vector(t(pm_annual))
+    names(r_cmaq)  <- paste0(v, "_annual_", yy)
+
+    if (isTRUE(save_coarse_annual)) {
+      out_cmaq <- file.path(out_dir, sprintf("CMAQ_%s_annual_%d_anchored.tif", v, yy))
+      writeRaster(r_cmaq, out_cmaq, overwrite = TRUE)
+      cat("    Saved 12km annual raster:\n      ", out_cmaq, "\n")
+    }
+
+    # --- Mean-preserving downscale to 1km ---
+    # Step 1: assign each 1km cell the parent 12km value (nearest neighbor)
+    cmaq_on_1km <- resample(r_cmaq, road_r, method = "ngb")
+
+    # Step 2: compute mean roadiness within each 12km cell, then map back to 1km
+    road_mean_on_1km <- resample(road_mean_12km, road_r, method = "ngb")
+
+    # Step 3: factor = road / mean(road within 12km); handle zeros safely
+    eps <- 1e-12
+    den <- road_mean_on_1km
+    den[is.na(den) | den < eps] <- NA
+
+    factor_mp <- road_r / den
+    factor_mp[is.na(factor_mp) | !is.finite(factor_mp)] <- 1
+
+    down_1km <- cmaq_on_1km * factor_mp
+    names(down_1km) <- sprintf("%s_downscaled1km_%s_%d", v, tag, yy)
+
+    out_down <- file.path(out_dir, sprintf("DOWN1KM_%s_%s_%d.tif", v, tag, yy))
+    writeRaster(down_1km, out_down, overwrite = TRUE)
+
+    # Quick sanity checks
+    m0 <- cellStats(cmaq_on_1km, "mean")
+    m1 <- cellStats(down_1km, "mean")
+    mx <- cellStats(down_1km, "max")
+
+    cat("    Saved 1km downscaled raster:\n      ", out_down, "\n")
+    cat(sprintf("    mean(cmaq_on_1km)=%.6f | mean(down_1km)=%.6f | max(down_1km)=%.4f\n", m0, m1, mx))
   }
 }
 
-message("\nDONE.")
+cat("\nDONE ✅\nOutputs written to:\n  ", out_dir, "\n")
