@@ -1,13 +1,19 @@
 # ============================================================
 # Auto PM2.5 (with_filter) Annual (2011–2020) + 1km Downscale
+# Inputs: /scratch/xshan2/R_Code/disperseR/Auto/NRD + /ONR
 # /home/xshan2/HAQ_LAB/Sumaiya/cmaq/cmaq_output/R/data/annual_rds/pm25_sectors/with_filter
-# Inputs: annual_rds/pm25_sectors/with_filter (NRD/ONR daily long tables)
+#   - PM25_TOT_NRD_cmaq_YYYY-01_YYYY-12.rds  (daily long table: x,y,Date,val)
+#   - PM25_TOT_ONR_cmaq_YYYY-01_YYYY-12.rds
 # Roadiness: 1km CSV with normalized weights
 # Deps: raster, data.table
-# Outputs: GeoTIFF + annual tables + QC txt
+# Outputs (per year):
+#   - AUTO_TOTAL_annual_YYYY_anchored.tif         (12km)
+#   - DOWN1KM_AUTO_TOTAL_<tag>_YYYY.tif           (1km)
+#   - TOTAL_YYYY_annual_xy.rds                    (x,y,total,nrd,onr)
+#   - QC_AUTO_TOTAL_<tag>_YYYY.txt                (QC report)
 # ============================================================
 
-rm(list = ls())
+rm(list=ls())
 suppressPackageStartupMessages({
   library(raster)
   library(data.table)
@@ -18,44 +24,34 @@ suppressPackageStartupMessages({
 # -----------------------------
 years <- 2011:2020
 
-# where you copied the with_filter rds to (Auto folder)
 auto_base <- "/scratch/xshan2/R_Code/disperseR/Auto"
 nrd_dir <- file.path(auto_base, "NRD")
 onr_dir <- file.path(auto_base, "ONR")
 
-# output directory
 out_dir <- file.path(auto_base, "AUTO_annual_downscale_1km")
-dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(out_dir, showWarnings=FALSE, recursive=TRUE)
 
-# roadiness (1km)
 road_csv <- "/scratch/xshan2/R_Code/disperseR/Auto/roadiness_2017/roadiness_1km_hw_loc_sherry.csv"
 road_weight_col <- "leng.distm2_hw_norm"   # highway
 # road_weight_col <- "leng.distm2_loc_norm" # local
 tag <- "hw"
 
-# projection (match roadiness)
 p4s <- "+proj=lcc +lat_1=33 +lat_2=45 +lat_0=40 +lon_0=-97 +a=6370000 +b=6370000 +units=m +no_defs"
-
-# coarse grid resolution (m)
 cmaq_res <- 12000
 
-# sample size for daily QC (optional)
+# daily QC sampling (bigger = more accurate, slower)
 sample_n <- 2e6
+
+# blow-up thresholds (very conservative; catches true explosions)
+max_cut <- 200
+p99_cut <- 50
+
+# netCDF fill value threshold (critical for 2014-like years)
+fill_cut <- -1e30
 
 # -----------------------------
 # HELPERS
 # -----------------------------
-parse_ym <- function(f) {
-  bn <- basename(f)
-  m <- regexpr("(20[0-9][0-9])(0[1-9]|1[0-2])", bn, perl = TRUE)
-  if (m[1] != -1) {
-    s <- regmatches(bn, m)
-    return(list(year = as.integer(substr(s, 1, 4)),
-                month = as.integer(substr(s, 5, 6))))
-  }
-  stop("Cannot parse year/month from filename: ", bn)
-}
-
 days_in_month <- function(y, m) {
   if (m == 12) {
     d1 <- as.Date(sprintf("%04d-12-01", y))
@@ -67,118 +63,69 @@ days_in_month <- function(y, m) {
   as.integer(d2 - d1)
 }
 
-require_var <- function(nc, v) {
-  vnames <- names(nc$var)
-  if (!(v %in% vnames)) {
-    stop("Variable not found: ", v, "\nAvailable vars include:\n  - ",
-         paste(vnames, collapse = "\n  - "))
-  }
-  v
-}
-
-# ---- detect bad "days" using sampling across grid ----
-# pm3d: [col,row,t] numeric
-# ndays: integer
-# return: bad day indices (1..ndays)
-detect_bad_days <- function(pm3d, ndays,
-                            sample_n = 300000,
-                            max_cut = 200,
-                            p99_cut = 50) {
-
-  nT <- dim(pm3d)[3]
-  if (is.null(nT) || nT < 2) return(integer(0))
-
-  # infer steps per day
-  steps_per_day <- nT / ndays
-  if (abs(steps_per_day - round(steps_per_day)) > 1e-8) {
-    warning("Time steps not divisible by ndays. nT=", nT, " ndays=", ndays,
-            ". Falling back to chunking by floor(nT/ndays).")
-    steps_per_day <- floor(nT / ndays)
-    if (steps_per_day < 1) return(integer(0))
-  } else {
-    steps_per_day <- as.integer(round(steps_per_day))
-  }
-
-  bad <- integer(0)
-
-  for (d in seq_len(ndays)) {
-    t1 <- (d - 1) * steps_per_day + 1
-    t2 <- min(d * steps_per_day, nT)
-
-    # daily mean over that day's time slice (handles hourly by averaging)
-    day_mean <- apply(pm3d[, , t1:t2, drop=FALSE], c(1,2), mean, na.rm=TRUE)
-
-    v <- as.vector(day_mean)
+# sample-based daily QC
+daily_stats_sample_dt <- function(dt, valcol, sample_n=2e6) {
+  setDT(dt)
+  dt[, {
+    v <- get(valcol)
     v <- v[is.finite(v)]
-    if (length(v) == 0) next
+    if (length(v) == 0) return(list(p99=NA_real_, mx=NA_real_))
     if (length(v) > sample_n) v <- sample(v, sample_n)
-
-    p99 <- as.numeric(quantile(v, 0.99, na.rm=TRUE))
-    mx  <- as.numeric(max(v, na.rm=TRUE))
-
-    if (is.finite(mx) && (mx > max_cut) || (is.finite(p99) && p99 > p99_cut)) {
-      bad <- c(bad, d)
-    }
-  }
-
-  unique(bad)
+    list(
+      p99 = as.numeric(quantile(v, 0.99, na.rm=TRUE)),
+      mx  = as.numeric(max(v, na.rm=TRUE))
+    )
+  }, by = Date]
 }
 
-# ---- replace bad days with last good day (locf) ----
-# pm3d: [col,row,t]
-# bad_days: indices in 1..ndays
-# ndays: integer
-# returns fixed pm3d
-locf_fill_bad_days <- function(pm3d, bad_days, ndays) {
-  nT <- dim(pm3d)[3]
-  if (length(bad_days) == 0 || is.null(nT) || nT < 2) return(pm3d)
+# LOCF fill for bad days (vectorized per cell)
+locf_fill_bad_days_dt <- function(dt, valcol, bad_dates) {
+  setDT(dt)
+  if (length(bad_dates) == 0) return(dt)
 
-  steps_per_day <- nT / ndays
-  if (abs(steps_per_day - round(steps_per_day)) > 1e-8) {
-    steps_per_day <- floor(nT / ndays)
-    if (steps_per_day < 1) return(pm3d)
-  } else {
-    steps_per_day <- as.integer(round(steps_per_day))
-  }
+  dt[, Date := as.Date(Date)]
+  bad_dates <- as.Date(bad_dates)
 
-  bad_days <- sort(unique(bad_days))
-  for (d in bad_days) {
-    # find last good day before d
-    prev <- setdiff(seq_len(d-1), bad_days)
-    if (length(prev) == 0) next
-    d0 <- tail(prev, 1)
-
-    t1  <- (d - 1) * steps_per_day + 1
-    t2  <- min(d * steps_per_day, nT)
-    t10 <- (d0 - 1) * steps_per_day + 1
-    t20 <- min(d0 * steps_per_day, nT)
-
-    # overwrite the entire day's time-slices with last good day's slices
-    # if different lengths (edge cases), recycle to min length
-    L  <- t2 - t1 + 1
-    L0 <- t20 - t10 + 1
-    Lmin <- min(L, L0)
-
-    pm3d[, , t1:(t1+Lmin-1)] <- pm3d[, , t10:(t10+Lmin-1)]
-    if (L > Lmin) {
-      # if current day has more slices, repeat last slice of d0
-      pm3d[, , (t1+Lmin):t2] <- pm3d[, , (t10+Lmin-1)]
-    }
-  }
-
-  pm3d
+  # mark bad -> NA, then locf by (x,y)
+  dt[Date %in% bad_dates, (valcol) := NA_real_]
+  setorder(dt, x, y, Date)
+  dt[, (valcol) := nafill(get(valcol), type="locf"), by=.(x,y)]
+  dt
 }
 
-# ============================================================
-# 0) READ ROADINESS -> 1km RASTER TEMPLATE 
-# ============================================================
+# build coarse raster from annual table (x,y as index grid; anchored to road extent)
+annual_xy_to_raster <- function(tot_dt, ex_road, cmaq_res, p4s) {
+  setDT(tot_dt)
+  ux <- sort(unique(tot_dt$x))
+  uy <- sort(unique(tot_dt$y))
+  ncol_cmaq <- length(ux)
+  nrow_cmaq <- length(uy)
+
+  mdt <- dcast(tot_dt, y ~ x, value.var = "pm25_total")
+  mat <- as.matrix(mdt[, -"y"])
+
+  r <- raster(
+    nrows = nrow_cmaq,
+    ncols = ncol_cmaq,
+    xmn = ex_road@xmin,
+    xmx = ex_road@xmin + ncol_cmaq * cmaq_res,
+    ymn = ex_road@ymin,
+    ymx = ex_road@ymin + nrow_cmaq * cmaq_res,
+    crs = CRS(p4s)
+  )
+  values(r) <- as.vector(t(mat))
+  r
+}
+
+# -----------------------------
+# 0) ROADINESS TEMPLATE
+# -----------------------------
 cat("Reading roadiness CSV:\n  ", road_csv, "\n")
-
 road_dt <- fread(road_csv)
-cn <- names(road_dt)
-xcol <- if ("x" %in% cn) "x" else if ("X" %in% cn) "X" else stop("No x column in roadiness CSV")
-ycol <- if ("y" %in% cn) "y" else if ("Y" %in% cn) "Y" else stop("No y column in roadiness CSV")
-stopifnot(road_weight_col %in% cn)
+stopifnot(road_weight_col %in% names(road_dt))
+
+xcol <- if ("x" %in% names(road_dt)) "x" else if ("X" %in% names(road_dt)) "X" else stop("No x column in roadiness CSV")
+ycol <- if ("y" %in% names(road_dt)) "y" else if ("Y" %in% names(road_dt)) "Y" else stop("No y column in roadiness CSV")
 
 road_dt <- road_dt[, .(x = get(xcol), y = get(ycol), w = get(road_weight_col))]
 road_dt[!is.finite(w) | is.na(w), w := 0]
@@ -196,169 +143,142 @@ cat("\nAggregation factor (coarse/fine): ", fact, "\n")
 road_mean_12km <- aggregate(road_r, fact = fact, fun = mean, na.rm = TRUE)
 ex_road <- extent(road_r)
 
-# ============================================================
-# 1) INDEX CMAQ FILES 
-# ============================================================
-cat("\nIndexing CMAQ files under:\n  ", post_dir, "\n")
-nc_files <- list.files(post_dir, pattern = "hr2day_w_organics.*\\.nc$", full.names = TRUE, recursive = TRUE)
-if (length(nc_files) == 0) stop("No hr2day_w_organics netCDF files found under post_dir.")
-
-meta <- rbindlist(lapply(nc_files, function(f) {
-  ym <- try(parse_ym(f), silent = TRUE)
-  if (inherits(ym, "try-error")) return(NULL)
-  data.table(file = f, year = ym$year, month = ym$month, base = basename(f))
-}), fill = TRUE)
-
-meta <- meta[year %in% years]
-setorder(meta, year, month, base)
-
-cat("\nFiles found per year (before de-dup):\n")
-print(meta[, .N, by = year])
-
-meta <- meta[, .SD[1], by = .(year, month)]
-setorder(meta, year, month)
-
-cat("\nFiles used per year (after de-dup by year-month):\n")
-print(meta[, .N, by = year])
-
-# ============================================================
-# 2) MAIN LOOP: YEARS x VARS (WITH blow-up fix)
-# ============================================================
-# thresholds for blow-up detection (tune if needed)
-sample_n <- 300000
-max_cut  <- 200
-p99_cut  <- 50
-
+# -----------------------------
+# 1) MAIN LOOP (years)
+# -----------------------------
 for (yy in years) {
 
-  files_y <- meta[year == yy]
-  if (nrow(files_y) == 0) {
-    cat("\n[SKIP] No files found for year:", yy, "\n")
-    next
-  }
-
-  qc_year <- file.path(out_dir, sprintf("QC_blowup_fix_%d_%s.txt", yy, tag))
-  cat("QC blow-up fix report | year=", yy, " tag=", tag, "\n\n", file=qc_year)
-
   cat("\n========================================\n")
-  cat("YEAR:", yy, "| months:", paste(sprintf("%02d", files_y$month), collapse = ","), "\n")
+  cat("YEAR:", yy, "\n")
   cat("========================================\n")
 
-  for (v in vars) {
+  pat <- sprintf("%d-01_%d-12", yy, yy)
+  f_nrd <- file.path(nrd_dir, sprintf("PM25_TOT_NRD_cmaq_%s.rds", pat))
+  f_onr <- file.path(onr_dir, sprintf("PM25_TOT_ONR_cmaq_%s.rds", pat))
+  stopifnot(file.exists(f_nrd), file.exists(f_onr))
 
-    cat("\n  ---- Processing variable:", v, "----\n")
-    cat("Variable: ", v, "\n", file=qc_year, append=TRUE)
+  qc_report <- file.path(out_dir, sprintf("QC_AUTO_TOTAL_%s_%d.txt", tag, yy))
+  cat(sprintf("QC report | year=%d tag=%s\nNRD=%s\nONR=%s\n\n", yy, tag, f_nrd, f_onr),
+      file = qc_report)
 
-    sum_mat <- NULL
-    tot_days <- 0L
-    ncol_cmaq <- NULL
-    nrow_cmaq <- NULL
+  # ---- read daily tables ----
+  nrd <- readRDS(f_nrd); setDT(nrd)
+  onr <- readRDS(f_onr); setDT(onr)
 
-    for (i in 1:nrow(files_y)) {
-      f  <- files_y$file[i]
-      mo <- files_y$month[i]
-      nd <- days_in_month(yy, mo)
+  # ---- standardize Date & handle fill ----
+  nrd[, Date := as.Date(Date)]
+  onr[, Date := as.Date(Date)]
 
-      cat("    Month", sprintf("%02d", mo), "| days =", nd, "|", basename(f), "\n")
+  # fill -> NA  (CRITICAL: fixes 2014-like behavior)
+  nrd[PM25_TOT_NRD < fill_cut, PM25_TOT_NRD := NA_real_]
+  onr[PM25_TOT_ONR < fill_cut, PM25_TOT_ONR := NA_real_]
 
-      nc <- nc_open(f)
-      vv <- require_var(nc, v)
-      pm <- ncvar_get(nc, vv)
-      nc_close(nc)
+  # physical: negatives -> 0 (after fill handled)
+  nrd[is.finite(PM25_TOT_NRD) & PM25_TOT_NRD < 0, PM25_TOT_NRD := 0]
+  onr[is.finite(PM25_TOT_ONR) & PM25_TOT_ONR < 0, PM25_TOT_ONR := 0]
 
-      # dims: [COL, ROW, T] or [COL, ROW, LAY, T]
-      if (length(dim(pm)) == 4) pm <- pm[, , 1, ]  # surface layer
+  # ---- daily QC + identify blow-up dates ----
+  stats_nrd <- daily_stats_sample_dt(nrd, "PM25_TOT_NRD", sample_n = sample_n)
+  stats_onr <- daily_stats_sample_dt(onr, "PM25_TOT_ONR", sample_n = sample_n)
 
-      # ---- NEW: blow-up detection + fix on the time dimension ----
-      bad_days <- detect_bad_days(pm, ndays = nd,
-                                  sample_n = sample_n,
-                                  max_cut  = max_cut,
-                                  p99_cut  = p99_cut)
+  bad_nrd <- stats_nrd[(mx > max_cut) | (p99 > p99_cut), Date]
+  bad_onr <- stats_onr[(mx > max_cut) | (p99 > p99_cut), Date]
+  bad_all <- sort(unique(c(bad_nrd, bad_onr)))
 
-      if (length(bad_days)) {
-        cat("      >>> bad days detected: ", paste(bad_days, collapse=","), "\n")
-        cat(sprintf("Month %02d: %s | bad_days = %s\n",
-                    mo, basename(f), paste(bad_days, collapse=",")),
-            file=qc_year, append=TRUE)
+  cat("Bad days (NRD): ",
+      if (length(bad_nrd)) paste(bad_nrd, collapse=", ") else "(none)",
+      "\n", file=qc_report, append=TRUE)
+  cat("Bad days (ONR): ",
+      if (length(bad_onr)) paste(bad_onr, collapse=", ") else "(none)",
+      "\n", file=qc_report, append=TRUE)
+  cat("Bad days (union): ",
+      if (length(bad_all)) paste(bad_all, collapse=", ") else "(none)",
+      "\n\n", file=qc_report, append=TRUE)
 
-        pm <- locf_fill_bad_days(pm, bad_days, ndays = nd)
-      } else {
-        cat(sprintf("Month %02d: %s | bad_days = none\n",
-                    mo, basename(f)),
-            file=qc_year, append=TRUE)
-      }
-
-      # Monthly mean over time dimension (after fixing)
-      pm_mean <- apply(pm, c(1, 2), mean, na.rm = TRUE)
-
-      # enforce physical: negatives -> 0 (optional but consistent with your later rule)
-      pm_mean[!is.finite(pm_mean)] <- NA_real_
-      pm_mean[pm_mean < 0] <- 0
-
-      if (is.null(sum_mat)) {
-        sum_mat <- pm_mean * nd
-        ncol_cmaq <- dim(pm_mean)[1]
-        nrow_cmaq <- dim(pm_mean)[2]
-      } else {
-        sum_mat <- sum_mat + pm_mean * nd
-      }
-
-      tot_days <- tot_days + nd
-
-      rm(pm, pm_mean); gc()
-    }
-
-    pm_annual <- sum_mat / tot_days
-
-    # Build 12km annual raster anchored to roadiness xmin/ymin
-    r_cmaq <- raster(
-      nrows = nrow_cmaq,
-      ncols = ncol_cmaq,
-      xmn = ex_road@xmin,
-      xmx = ex_road@xmin + ncol_cmaq * cmaq_res,
-      ymn = ex_road@ymin,
-      ymx = ex_road@ymin + nrow_cmaq * cmaq_res,
-      crs = CRS(p4s)
-    )
-
-    values(r_cmaq) <- as.vector(t(pm_annual))
-    names(r_cmaq)  <- paste0(v, "_annual_", yy)
-
-    if (isTRUE(save_coarse_annual)) {
-      out_cmaq <- file.path(out_dir, sprintf("CMAQ_%s_annual_%d_anchored.tif", v, yy))
-      writeRaster(r_cmaq, out_cmaq, overwrite = TRUE)
-      cat("    Saved 12km annual raster:\n      ", out_cmaq, "\n")
-    }
-
-    # --- Mean-preserving downscale to 1km ---
-    cmaq_on_1km <- resample(r_cmaq, road_r, method = "ngb")
-    road_mean_on_1km <- resample(road_mean_12km, road_r, method = "ngb")
-
-    eps <- 1e-12
-    den <- road_mean_on_1km
-    den[is.na(den) | den < eps] <- NA
-
-    factor_mp <- road_r / den
-    factor_mp[is.na(factor_mp) | !is.finite(factor_mp)] <- 1
-
-    down_1km <- cmaq_on_1km * factor_mp
-    names(down_1km) <- sprintf("%s_downscaled1km_%s_%d", v, tag, yy)
-
-    out_down <- file.path(out_dir, sprintf("DOWN1KM_%s_%s_%d.tif", v, tag, yy))
-    writeRaster(down_1km, out_down, overwrite = TRUE)
-
-    # Quick sanity checks
-    m0 <- cellStats(cmaq_on_1km, "mean")
-    m1 <- cellStats(down_1km, "mean")
-    mx <- cellStats(down_1km, "max")
-
-    cat("    Saved 1km downscaled raster:\n      ", out_down, "\n")
-    cat(sprintf("    mean(cmaq_on_1km)=%.6f | mean(down_1km)=%.6f | max(down_1km)=%.4f\n", m0, m1, mx))
-
-    cat(sprintf("Year %d | %s | mean_coarse=%.6f mean_1km=%.6f max_1km=%.6f\n\n",
-                yy, v, cellStats(r_cmaq,"mean"), m1, mx),
-        file=qc_year, append=TRUE)
+  # ---- LOCF fill bad days (use union so NRD/ONR aligned in time) ----
+  if (length(bad_all)) {
+    nrd <- locf_fill_bad_days_dt(nrd, "PM25_TOT_NRD", bad_all)
+    onr <- locf_fill_bad_days_dt(onr, "PM25_TOT_ONR", bad_all)
   }
+
+  # ---- annual mean by cell ----
+  pm_nrd <- nrd[, .(pm25_nrd = mean(PM25_TOT_NRD, na.rm=TRUE)), by=.(x,y)]
+  pm_onr <- onr[, .(pm25_onr = mean(PM25_TOT_ONR, na.rm=TRUE)), by=.(x,y)]
+  setkey(pm_nrd, x,y); setkey(pm_onr, x,y)
+
+  tot <- pm_nrd[pm_onr]
+  tot[, pm25_total := pmax(0, pm25_nrd) + pmax(0, pm25_onr)]
+
+  # save annual xy table
+  out_tot_rds <- file.path(out_dir, sprintf("TOTAL_%d_annual_xy.rds", yy))
+  saveRDS(tot[, .(x,y,pm25_total,pm25_nrd,pm25_onr)], out_tot_rds)
+
+  # ---- build coarse raster from table (anchored) ----
+  r_tot <- annual_xy_to_raster(tot[, .(x,y,pm25_total)], ex_road, cmaq_res, p4s)
+  names(r_tot) <- sprintf("AUTO_TOTAL_annual_%d", yy)
+
+  out_coarse <- file.path(out_dir, sprintf("AUTO_TOTAL_annual_%d_anchored.tif", yy))
+  writeRaster(r_tot, out_coarse, overwrite=TRUE)
+
+  # ---- mean-preserving downscale to 1km ----
+  tot_on_1km <- resample(r_tot, road_r, method="ngb")
+  road_mean_on_1km <- resample(road_mean_12km, road_r, method="ngb")
+
+  eps <- 1e-12
+  den <- road_mean_on_1km
+  den[is.na(den) | den < eps] <- NA
+
+  factor_mp <- road_r / den
+  factor_mp[is.na(factor_mp) | !is.finite(factor_mp)] <- 1
+
+  down_1km <- tot_on_1km * factor_mp
+  names(down_1km) <- sprintf("DOWN1KM_AUTO_TOTAL_%s_%d", tag, yy)
+
+  out_down <- file.path(out_dir, sprintf("DOWN1KM_AUTO_TOTAL_%s_%d.tif", tag, yy))
+  writeRaster(down_1km, out_down, overwrite=TRUE)
+
+  # ---- QC summaries ----
+  sum_tot <- tot[, .(
+    n_cells = .N,
+    min  = min(pm25_total, na.rm=TRUE),
+    p50  = quantile(pm25_total, 0.50, na.rm=TRUE),
+    p95  = quantile(pm25_total, 0.95, na.rm=TRUE),
+    p99  = quantile(pm25_total, 0.99, na.rm=TRUE),
+    max  = max(pm25_total, na.rm=TRUE),
+    mean = mean(pm25_total, na.rm=TRUE),
+    sd   = sd(pm25_total, na.rm=TRUE),
+    share_gt200 = mean(pm25_total > 200, na.rm=TRUE)
+  )]
+
+  m0 <- cellStats(tot_on_1km, "mean")
+  m1 <- cellStats(down_1km, "mean")
+  mx <- cellStats(down_1km, "max")
+  mn <- cellStats(down_1km, "min")
+
+  # aggregate back to 12km and compare (mean-preservation check)
+  down_back_12km <- aggregate(down_1km, fact=fact, fun=mean, na.rm=TRUE)
+  down_back_12km <- resample(down_back_12km, r_tot, method="bilinear")
+  diff_r <- down_back_12km - r_tot
+
+  absdiff <- cellStats(abs(diff_r), "max")
+  meandiff <- cellStats(diff_r, "mean")
+
+  cat("Annual TOTAL (table) summary:\n",
+      paste(capture.output(print(sum_tot)), collapse="\n"),
+      "\n\n", file=qc_report, append=TRUE)
+
+  cat(sprintf("Downscale QC:\n  mean_coarse=%.6f | mean_down1km=%.6f\n  min_down1km=%.6f | max_down1km=%.6f\n  max_absdiff_back12km=%.6f\n  mean_diff_back12km=%.6f\n\n",
+              cellStats(r_tot,"mean"), m1, mn, mx, absdiff, meandiff),
+      file=qc_report, append=TRUE)
+
+  cat("Outputs:\n",
+      "  ", out_coarse, "\n",
+      "  ", out_down, "\n",
+      "  ", out_tot_rds, "\n",
+      "  ", qc_report, "\n\n", file=qc_report, append=TRUE)
+
+  cat("Saved:\n  ", out_coarse, "\n  ", out_down, "\n")
+  rm(nrd, onr, pm_nrd, pm_onr, tot, r_tot, tot_on_1km, down_1km, down_back_12km, diff_r); gc()
 }
 
 cat("\nDONE ✅\nOutputs written to:\n  ", out_dir, "\n")
