@@ -69,12 +69,16 @@ daily_stats_sample_dt <- function(dt, valcol, sample_n=2e6) {
   dt[, {
     v <- get(valcol)
     v <- v[is.finite(v)]
-    if (length(v) == 0) return(list(p99=NA_real_, mx=NA_real_))
     if (length(v) > sample_n) v <- sample(v, sample_n)
-    list(
-      p99 = as.numeric(quantile(v, 0.99, na.rm=TRUE)),
-      mx  = as.numeric(max(v, na.rm=TRUE))
-    )
+
+    if (length(v) == 0) {
+      list(p99 = NA_real_, mx = NA_real_)
+    } else {
+      list(
+        p99 = as.numeric(quantile(v, 0.99, na.rm=TRUE)),
+        mx  = as.numeric(max(v, na.rm=TRUE))
+      )
+    }
   }, by = Date]
 }
 
