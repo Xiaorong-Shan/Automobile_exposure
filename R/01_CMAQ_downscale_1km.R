@@ -290,3 +290,14 @@ for (yy in years) {
 }
 
 cat("\nDONE ✅\nOutputs written to:\n  ", out_dir, "\n")
+
+#============================== Results check ================================
+library(raster); library(data.table)
+base_dir <- "/scratch/xshan2/R_Code/disperseR/Auto/AUTO_annual_downscale_1km"
+yrs <- 2011:2020
+
+chk <- rbindlist(lapply(yrs, function(yy){
+  r <- raster(file.path(base_dir, sprintf("AUTO_TOTAL_annual_%d_anchored.tif", yy)))
+  data.table(year=yy, mean=cellStats(r,"mean"), max=cellStats(r,"max"))
+}))
+print(chk)
