@@ -1,128 +1,66 @@
 #!/usr/bin/env Rscript
-# ============================================================
-# Mean-conserving 1 km downscaling of 12 km CMAQ annual PM2.5
-# using:
-#   C_i = C_g * [ r_i * U_i^{-1} * f(Δθ_i) ] / mean_{j in g}[ r_j * U_j^{-1} * f(Δθ_j) ]
-#
-# Key fixes in this version:
-#   (A) CLIP the 1 km grid to the state boundary (so "VA" is truly VA-only).
-#       This prevents massive NA wind extraction when wind tif is state-masked.
-#   (B) Wind extraction transforms points to the wind raster CRS (no hard-coded lon/lat).
-#   (C) Panel maps are skipped if yearly FSTs are missing.
-# ============================================================
 
 suppressPackageStartupMessages({
   library(data.table)
   library(sf)
   library(fst)
+  library(raster)
   library(ggplot2)
   library(USAboundaries)
   library(viridis)
   library(scales)
-  library(raster)
 })
 
-# ============================================================
-# SETTINGS (EDIT FOR EACH STATE)
-# ============================================================
-
-# ---- State ID
+# =========================================================
+# SETTINGS
+# =========================================================
 state_abbr <- "VA"
+years <- 2011:2020
+metric <- "mean"
 
-# ---- Projection used by your 1 km roadiness grid (LCC)
 p4s <- "+proj=lcc +lat_1=33 +lat_2=45 +lat_0=40 +lon_0=-97 +a=6370000 +b=6370000"
 
-# ---- Base directories
 base_dir   <- "/scratch/xshan2/R_Code/Automobiles"
-annual_dir <- file.path(base_dir, "FIGURES")  # contains ANNUAL_{NRD,ONR}_{mean|median}_{year}.rds
+annual_dir <- file.path(base_dir, "FIGURES")
 
-# ---- 1 km roadiness grid (must contain x,y and roadiness columns)
-roadiness_fst <- sprintf("/scratch/xshan2/R_Code/disperseR/Auto/roadiness_2017/%s/roadiness_1km_hw_loc_%s.fst",
-                         state_abbr, state_abbr)
+roadiness_fst <- "/scratch/xshan2/R_Code/disperseR/Auto/roadiness_2017/VA/roadiness_1km_hw_loc_VA.fst"
 
-# ---- Road centerlines (for computing φ_i once)
-roads_shp <- "/scratch/xshan2/R_Code/Automobiles/roadiness/TRAN_Virginia_State_Shape/Shape/Trans_RoadSegment.shp"
+road_col_NRD <- "nroad.dist2_loc"  # gasoline / local roads
+road_col_ONR <- "nroad.dist2_hw"   # diesel / highway roads
 
-# Optional: filter expression to keep only major roads (set NULL to keep all).
-roads_filter_expr <- NULL
+wind_dir <- "/scratch/xshan2/NLDAS_wind/VA"
 
-# ---- Wind GeoTIFF: annual mean u/v (Band1=Wind_E=u, Band2=Wind_N=v)
-wind_dir     <- sprintf("/scratch/xshan2/NLDAS_wind/%s", state_abbr)
-wind_tif_fmt <- file.path(wind_dir, sprintf("NLDAS_%s_%%d_Wind_EN_mean.tif", state_abbr))
+out_dir      <- file.path(base_dir, "DOWNSCALE_1KM_VA_WIND_2011_2020_SAVE_ALL")
+out_weight   <- file.path(out_dir, "01_WIND_WEIGHTS_FST")
+out_pm       <- file.path(out_dir, "02_PM1_WIND_FST")
+out_total    <- file.path(out_dir, "03_TOTAL_FST")
+out_fig      <- file.path(out_dir, "04_PANEL_FIGURES")
+out_diag     <- file.path(out_dir, "05_DIAGNOSTICS")
 
-# ---- Years and CMAQ metric
-years  <- 2011:2020
-metric <- "mean"  # or "median"
+dir.create(out_weight, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_pm,     recursive = TRUE, showWarnings = FALSE)
+dir.create(out_total,  recursive = TRUE, showWarnings = FALSE)
+dir.create(out_fig,    recursive = TRUE, showWarnings = FALSE)
+dir.create(out_diag,   recursive = TRUE, showWarnings = FALSE)
 
-# ---- Roadiness columns
-road_col_NRD <- "nroad.dist2_loc"
-road_col_ONR <- "nroad.dist2_hw"
-
-# ---- Alignment function choice
-# "cos01"  : f(Δθ) = (1 + cos(Δθ))/2   in [0,1]
-# "cospos" : f(Δθ) = max(cos(Δθ), 0)   in [0,1]
-align_fun <- "cos01"
-
-# ---- Chunk size for nearest-road matching (φ computation)
-phi_chunk_size <- 50000
-
-# ---- Numerical safeguard for division by zero only
 eps <- 1e-12
+U0 <- 0.1
+beta_wind <- 0.5
 
-# ---- Output folders
-out_dir  <- file.path(base_dir, sprintf("DOWNSCALE_1KM_%s_ROAD_WINDDIR_NORMONLY", state_abbr))
-out_data <- file.path(out_dir, "DATA_FST")
-out_fig  <- file.path(out_dir, "FIGURES")
-out_aux  <- file.path(out_dir, "AUX")  # cache phi here
-dir.create(out_data, recursive = TRUE, showWarnings = FALSE)
-dir.create(out_fig,  recursive = TRUE, showWarnings = FALSE)
-dir.create(out_aux,  recursive = TRUE, showWarnings = FALSE)
-
-phi_cache_fst <- file.path(out_aux, sprintf("%s_1km_phi_from_roads.fst", state_abbr))
-
-# ---- Panel plot options (optional)
-make_panel_maps <- TRUE
-facet_ncol <- 5
 legend_upper_q <- 0.99
+facet_ncol <- 5
 
-# ============================================================
+# =========================================================
 # HELPERS
-# ============================================================
+# =========================================================
+msg <- function(...) cat(format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "|", ..., "\n")
 
-msg <- function(...) cat(paste0(..., "\n"))
-
-stopif_has_cols <- function(dt, cols, where = "object") {
-  miss <- setdiff(cols, names(dt))
-  if (length(miss) > 0) stop(where, " is missing columns: ", paste(miss, collapse = ", "))
-  invisible(TRUE)
+get_va_boundary <- function() {
+  va <- USAboundaries::us_states(resolution = "low")
+  va <- va[va$state_abbr == state_abbr, ]
+  st_transform(st_as_sf(va), st_crs(p4s))
 }
 
-# ------------------------------------------------------------
-# Clip 1 km points to state boundary (keep only points within state)
-# This is the MOST important fix if your 1 km grid is a rectangle bbox
-# and your wind tif is masked to the state boundary.
-# ------------------------------------------------------------
-clip_points_to_state <- function(dt_xy, state_abbr, p4s) {
-  stopif_has_cols(dt_xy, c("x","y"), where = "dt_xy for clip")
-
-  st_outline <- USAboundaries::us_states(resolution = "low")
-  st_outline <- st_outline[st_outline$state_abbr == state_abbr, ]
-  if (nrow(st_outline) == 0) stop("State not found in USAboundaries: ", state_abbr)
-
-  st_outline <- st_transform(st_as_sf(st_outline), st_crs(p4s))
-
-  pts <- st_as_sf(dt_xy, coords = c("x","y"), crs = st_crs(p4s), remove = FALSE)
-  inside <- st_within(pts, st_outline, sparse = FALSE)[,1]
-
-  msg("Clip to ", state_abbr, ": kept ", sum(inside), " / ", nrow(dt_xy),
-      " (", round(100*mean(inside), 2), "%) points")
-
-  dt_xy[inside]
-}
-
-# ------------------------------------------------------------
-# Read annual CMAQ RDS: lon, lat, val
-# ------------------------------------------------------------
 read_annual_rds <- function(sector, metric, yr) {
   f <- file.path(annual_dir, sprintf("ANNUAL_%s_%s_%d.rds", sector, metric, yr))
   if (!file.exists(f)) stop("Missing annual RDS: ", f)
@@ -130,250 +68,302 @@ read_annual_rds <- function(sector, metric, yr) {
   dt <- readRDS(f)
   setDT(dt)
 
-  stopif_has_cols(dt, c("lon","lat","val"), where = paste0("Annual RDS ", f))
+  if (!all(c("lon", "lat", "val") %in% names(dt))) {
+    stop("Annual RDS must contain lon, lat, val: ", f)
+  }
+
   dt <- dt[is.finite(val) & !is.na(val)]
   dt
 }
 
-# ------------------------------------------------------------
-# Load 1 km roadiness grid with a selected column -> (x,y,road)
-# ------------------------------------------------------------
 load_roadiness <- function(colname) {
-  if (!file.exists(roadiness_fst)) stop("roadiness_fst not found: ", roadiness_fst)
-
   rd <- read_fst(roadiness_fst, as.data.table = TRUE)
   setDT(rd)
 
-  stopif_has_cols(rd, c("x","y"), where = "roadiness_fst")
-  if (!(colname %in% names(rd))) stop("Roadiness col not found: ", colname)
+  if (!all(c("x", "y") %in% names(rd))) stop("Roadiness fst must contain x,y.")
+  if (!(colname %in% names(rd))) stop("Missing roadiness column: ", colname)
 
-  out <- rd[, .(x, y, road = as.numeric(get(colname)))]
-  out[!is.finite(road) | is.na(road), road := 0]
-  out
+  dt <- rd[, .(
+    x = x,
+    y = y,
+    road = as.numeric(get(colname))
+  )]
+
+  dt[!is.finite(road) | is.na(road), road := 0]
+  dt[road < 0, road := 0]
+
+  dt
 }
 
-# ------------------------------------------------------------
-# Build unique CMAQ centroid grid and map each 1 km cell to its
-# nearest CMAQ centroid (index vector length = n_1km)
-# ------------------------------------------------------------
-make_pmgrid_and_mapidx <- function(pm_dt, road_sf_ref, p4s) {
-  pmgrid <- unique(pm_dt[, .(lon, lat)])
-  pmgrid[, grid_id := .I]
-
-  pm_sf <- st_as_sf(pmgrid, coords = c("lon","lat"), crs = 4326, remove = FALSE)
-  pm_sf <- st_transform(pm_sf, st_crs(p4s))
-
-  idx <- st_nearest_feature(road_sf_ref, pm_sf)
-  list(pmgrid = pmgrid, idx = idx)
+detect_grid_spacing <- function(dt) {
+  list(
+    dx = median(diff(sort(unique(dt$x))), na.rm = TRUE),
+    dy = median(diff(sort(unique(dt$y))), na.rm = TRUE)
+  )
 }
 
-# ------------------------------------------------------------
-# Compute per-road bearing (phi) in radians:
-# 0=East, pi/2=North, range [-pi, pi]
-# ------------------------------------------------------------
-bearing_from_linestring <- function(geom) {
-  coords <- st_coordinates(geom)
-  if (nrow(coords) < 2) return(NA_real_)
-  x1 <- coords[1, "X"];  y1 <- coords[1, "Y"]
-  x2 <- coords[nrow(coords), "X"]; y2 <- coords[nrow(coords), "Y"]
-  atan2(y2 - y1, x2 - x1)
-}
+extract_wind <- function(road_dt, yr) {
+  msg("Extracting wind for year:", yr)
 
-# ------------------------------------------------------------
-# Compute φ_i for each 1 km grid cell i:
-# φ_i = bearing of nearest road segment
-# Cached to phi_cache_fst for reuse across years.
-# ------------------------------------------------------------
-compute_or_load_phi <- function(road_xy_dt,
-                                roads_shp,
-                                p4s,
-                                phi_cache_fst,
-                                chunk_size = 50000,
-                                filter_expr = NULL) {
-  stopif_has_cols(road_xy_dt, c("x","y"), where = "road_xy_dt for phi")
-
-  if (file.exists(phi_cache_fst)) {
-    msg("Loading cached phi: ", phi_cache_fst)
-    phi_dt <- read_fst(phi_cache_fst, as.data.table = TRUE)
-    setDT(phi_dt)
-    stopif_has_cols(phi_dt, c("x","y","phi"), where = "phi_cache_fst")
-    return(phi_dt)
-  }
-
-  if (!file.exists(roads_shp)) stop("roads_shp not found: ", roads_shp)
-
-  msg("Reading roads: ", roads_shp)
-  roads <- st_read(roads_shp, quiet = TRUE)
-  if (nrow(roads) == 0) stop("roads_shp has 0 features: ", roads_shp)
-
-  if (!is.null(filter_expr)) {
-    roads <- roads[eval(filter_expr, envir = roads), ]
-    if (nrow(roads) == 0) stop("No roads left after filtering. Check roads_filter_expr.")
-  }
-
-  roads <- st_transform(roads, st_crs(p4s))
-  roads <- st_cast(roads, "LINESTRING", warn = FALSE)
-
-  msg("Computing road bearings (phi) for ", nrow(roads), " segments ...")
-  roads$phi <- vapply(st_geometry(roads), bearing_from_linestring, numeric(1))
-  if (sum(!is.finite(roads$phi)) > 0) {
-    stop("Some road bearings are NA/Inf. Check road geometry.")
-  }
-
-  pts <- st_as_sf(road_xy_dt, coords = c("x","y"), crs = st_crs(p4s), remove = FALSE)
-
-  n <- nrow(pts)
-  idx <- integer(n)
-
-  msg("Computing nearest-road index for ", n, " grid points (chunk_size=", chunk_size, ") ...")
-  t0 <- Sys.time()
-  for (s in seq(1, n, by = chunk_size)) {
-    e <- min(s + chunk_size - 1, n)
-    idx[s:e] <- st_nearest_feature(pts[s:e, ], roads)
-    msg("  done: ", e, " / ", n)
-  }
-  msg("Elapsed (min): ", round(difftime(Sys.time(), t0, units = "mins"), 2))
-
-  phi_dt <- copy(road_xy_dt)
-  phi_dt[, phi := as.numeric(roads$phi[idx])]
-
-  if (sum(!is.finite(phi_dt$phi)) > 0) stop("phi_dt contains NA/Inf, unexpected.")
-
-  write_fst(phi_dt[, .(x,y,phi)], phi_cache_fst)
-  msg("WROTE phi cache: ", phi_cache_fst, " | rows=", nrow(phi_dt))
-
-  phi_dt[, .(x,y,phi)]
-}
-
-# ------------------------------------------------------------
-# Extract annual mean wind (u/v) to 1 km centroids:
-# - Band 1 = u (Wind_E)
-# - Band 2 = v (Wind_N)
-# Returns U and theta in radians
-#
-# IMPORTANT:
-#   Transform points to the WIND RASTER CRS (not hard-coded lon/lat).
-# ------------------------------------------------------------
-extract_wind_uv_to_road <- function(road_xy_dt, yr, p4s, eps = 1e-12, method = "bilinear") {
-  wind_tif <- sprintf(wind_tif_fmt, yr)
+  wind_tif <- file.path(wind_dir, sprintf("NLDAS_%s_%d_Wind_EN_mean.tif", state_abbr, yr))
   if (!file.exists(wind_tif)) stop("Missing wind tif: ", wind_tif)
 
   wd <- raster::brick(wind_tif)
-  if (raster::nlayers(wd) < 2) stop("Wind tif must have >=2 bands (u,v): ", wind_tif)
 
-  rcrs_obj <- raster::crs(wd)
-  rcrs_txt <- as.character(rcrs_obj)
-  if (is.na(rcrs_txt) || nchar(rcrs_txt) == 0) stop("Wind raster has missing CRS: ", wind_tif)
+  pts <- st_as_sf(
+    road_dt[, .(x, y)],
+    coords = c("x", "y"),
+    crs = st_crs(p4s),
+    remove = FALSE
+  )
 
-  pts_lcc <- st_as_sf(road_xy_dt, coords = c("x","y"), crs = st_crs(p4s), remove = FALSE)
-  pts_ras <- st_transform(pts_lcc, st_crs(rcrs_txt))
-  xy      <- st_coordinates(pts_ras)
+  pts_ll <- st_transform(pts, crs(wd))
+  xy <- st_coordinates(pts_ll)
 
-  u <- raster::extract(wd[[1]], xy, method = method)
-  v <- raster::extract(wd[[2]], xy, method = method)
+  u <- raster::extract(wd[[1]], xy)
+  v <- raster::extract(wd[[2]], xy)
 
-  out <- copy(road_xy_dt)
-  out[, `:=`(u = as.numeric(u), v = as.numeric(v))]
+  dt <- copy(road_dt)
+  dt[, u := u]
+  dt[, v := v]
+  dt[, windspeed := sqrt(u^2 + v^2)]
+  dt[, theta_to := atan2(v, u)]
 
-  bad <- !is.finite(out$u) | !is.finite(out$v)
-  if (any(bad)) {
-    # After CLIPPING to state, this should be near zero.
-    stop("Wind extraction still has non-finite u/v for ", sum(bad), " points. ",
-         "This suggests the wind tif has NA even inside the state domain. ",
-         "Check how the wind tif was created/masked.")
+  ws_med <- median(dt$windspeed, na.rm = TRUE)
+  dt[!is.finite(windspeed) | is.na(windspeed), windspeed := ws_med]
+  dt[!is.finite(theta_to) | is.na(theta_to), theta_to := 0]
+
+  dt
+}
+
+attach_neighbor_road <- function(dt, name, sx, sy, dx_grid, dy_grid) {
+  tmp <- copy(dt)
+
+  tmp[, nx := x + sx * dx_grid]
+  tmp[, ny := y + sy * dy_grid]
+
+  src <- dt[, .(
+    nx = x,
+    ny = y,
+    road_neighbor = road
+  )]
+
+  setkey(src, nx, ny)
+  setkey(tmp, nx, ny)
+
+  tmp <- src[tmp]
+
+  new_col <- paste0("road_", name)
+  setnames(tmp, "road_neighbor", new_col)
+
+  tmp[!is.finite(get(new_col)) | is.na(get(new_col)), (new_col) := road]
+  tmp[, c("nx", "ny") := NULL]
+
+  tmp
+}
+
+make_wind_weight <- function(road_wind_dt) {
+  msg("Computing 8-neighbor upwind roadiness + wind-speed beta factor ...")
+
+  dt <- copy(road_wind_dt)
+
+  gs <- detect_grid_spacing(dt)
+  dx_grid <- gs$dx
+  dy_grid <- gs$dy
+
+  msg("Grid spacing:", dx_grid, dy_grid)
+
+  dt <- attach_neighbor_road(dt, "E",   1,  0, dx_grid, dy_grid)
+  dt <- attach_neighbor_road(dt, "NE",  1,  1, dx_grid, dy_grid)
+  dt <- attach_neighbor_road(dt, "N",   0,  1, dx_grid, dy_grid)
+  dt <- attach_neighbor_road(dt, "NW", -1,  1, dx_grid, dy_grid)
+  dt <- attach_neighbor_road(dt, "W",  -1,  0, dx_grid, dy_grid)
+  dt <- attach_neighbor_road(dt, "SW", -1, -1, dx_grid, dy_grid)
+  dt <- attach_neighbor_road(dt, "S",   0, -1, dx_grid, dy_grid)
+  dt <- attach_neighbor_road(dt, "SE",  1, -1, dx_grid, dy_grid)
+
+  # Upwind source direction = opposite of wind blowing-to direction
+  dt[, theta_upwind := (theta_to + pi) %% (2 * pi)]
+
+  dirs <- data.table(
+    name  = c("E", "NE", "N", "NW", "W", "SW", "S", "SE"),
+    angle = c(0, pi/4, pi/2, 3*pi/4, pi, 5*pi/4, 3*pi/2, 7*pi/4),
+    col   = c("road_E", "road_NE", "road_N", "road_NW", "road_W", "road_SW", "road_S", "road_SE")
+  )
+
+  for (k in seq_len(nrow(dirs))) {
+    cname <- paste0("angdiff_", dirs$name[k])
+    wname <- paste0("w_", dirs$name[k])
+    a <- dirs$angle[k]
+
+    dt[, (cname) := abs(atan2(sin(theta_upwind - a), cos(theta_upwind - a)))]
+    dt[, (wname) := 1 / (get(cname) + 0.05)]
   }
 
-  out[, `:=`(
-    U     = sqrt(u^2 + v^2) + eps,
-    theta = atan2(v, u)
+  weight_cols <- paste0("w_", dirs$name)
+  road_cols   <- dirs$col
+
+  dt[, w_sum := rowSums(.SD, na.rm = TRUE), .SDcols = weight_cols]
+  dt[, road_upwind8 := 0]
+
+  for (k in seq_along(weight_cols)) {
+    dt[, road_upwind8 := road_upwind8 + get(weight_cols[k]) * get(road_cols[k])]
+  }
+
+  dt[, road_upwind8 := road_upwind8 / (w_sum + eps)]
+  dt[!is.finite(road_upwind8) | is.na(road_upwind8), road_upwind8 := road]
+
+  ws_mean <- mean(dt$windspeed, na.rm = TRUE)
+
+  dt[, speed_factor_beta := ((ws_mean + eps) / (windspeed + U0))^beta_wind]
+
+  # final wind-adjusted redistribution weight
+  dt[, W_wind := road_upwind8 * speed_factor_beta]
+
+  dt[!is.finite(W_wind) | is.na(W_wind), W_wind := 0]
+  dt[W_wind < 0, W_wind := 0]
+
+  # keep useful intermediate variables
+  out <- dt[, .(
+    x, y,
+    road,
+    u, v,
+    windspeed,
+    theta_to,
+    theta_upwind,
+    road_upwind8,
+    speed_factor_beta,
+    W_wind
   )]
 
   out
 }
 
-# ------------------------------------------------------------
-# Alignment function f(Δθ)
-# ------------------------------------------------------------
-align_factor <- function(delta, mode = c("cos01","cospos")) {
-  mode <- match.arg(mode)
-  if (mode == "cos01")  return((1 + cos(delta)) / 2)
-  if (mode == "cospos") return(pmax(cos(delta), 0))
-}
+make_pmgrid_and_mapidx <- function(cmaq_dt, road_dt) {
+  pmgrid <- unique(cmaq_dt[, .(lon, lat)])
+  pmgrid[, grid_id := .I]
 
-# ------------------------------------------------------------
-# Downscale one layer (NRD or ONR) using the formula above
-# Returns: (x,y,pm1)
-# ------------------------------------------------------------
-downscale_one_layer_formula <- function(pm_dt, pmgrid, idx_cmaq, road_dt, eps = 1e-12, align_fun = "cos01") {
+  pm_sf <- st_as_sf(
+    pmgrid,
+    coords = c("lon", "lat"),
+    crs = 4326,
+    remove = FALSE
+  )
+  pm_sf <- st_transform(pm_sf, st_crs(p4s))
 
-  stopif_has_cols(pm_dt, c("lon","lat","val"), where = "pm_dt")
-  stopif_has_cols(pmgrid, c("lon","lat","grid_id"), where = "pmgrid")
-  stopif_has_cols(road_dt, c("x","y","road","phi","U","theta"), where = "road_dt")
-
-  pm_dt2 <- merge(pm_dt[, .(lon, lat, Cg = val)], pmgrid, by = c("lon","lat"), all.x = TRUE)
-  if (any(is.na(pm_dt2$grid_id))) {
-    stop("Some CMAQ cells could not be matched to pmgrid by lon/lat. Check grid consistency.")
-  }
-  setkey(pm_dt2, grid_id)
-
-  dt <- copy(road_dt)
-  dt[, grid_id := pmgrid$grid_id[idx_cmaq]]
-  setkey(dt, grid_id)
-
-  dt <- pm_dt2[dt]
-
-  dt[, r := pmax(road, 0)]
-  dt[, delta := atan2(sin(theta - phi), cos(theta - phi))]
-  dt[, f := align_factor(delta, mode = align_fun)]
-  dt[, S := r * (1 / U) * f]
-  dt[, Sbar := mean(S, na.rm = TRUE), by = grid_id]
-  dt[, Ci := Cg * (S / (Sbar + eps))]
-
-  dt[, .(x, y, pm1 = Ci)]
-}
-
-# ------------------------------------------------------------
-# Save FST
-# ------------------------------------------------------------
-save_fst <- function(dt, outfile) {
-  write_fst(dt, outfile)
-  msg("WROTE: ", outfile, " | rows=", nrow(dt), " | size=", file.info(outfile)$size)
-}
-
-# ------------------------------------------------------------
-# Stack years for panel maps
-# ------------------------------------------------------------
-read_stack_years <- function(layer = c("NRD","ONR","TOTAL"), years, metric, out_data) {
-  layer <- match.arg(layer)
-
-  files <- switch(layer,
-    NRD   = file.path(out_data, sprintf("%s_1km_NRD_%s_%d.fst",   state_abbr, metric, years)),
-    ONR   = file.path(out_data, sprintf("%s_1km_ONR_%s_%d.fst",   state_abbr, metric, years)),
-    TOTAL = file.path(out_data, sprintf("%s_1km_TOTAL_%s_%d.fst", state_abbr, metric, years))
+  road_sf <- st_as_sf(
+    road_dt[, .(x, y)],
+    coords = c("x", "y"),
+    crs = st_crs(p4s),
+    remove = FALSE
   )
 
-  lst <- lapply(seq_along(years), function(i){
+  idx <- st_nearest_feature(road_sf, pm_sf)
+
+  list(pmgrid = pmgrid, idx = idx)
+}
+
+downscale_with_weight <- function(cmaq_dt, pmgrid, idx, weight_dt) {
+  pm_dt2 <- merge(
+    cmaq_dt[, .(lon, lat, pm12 = val)],
+    pmgrid,
+    by = c("lon", "lat"),
+    all.x = TRUE
+  )
+
+  if (any(is.na(pm_dt2$grid_id))) {
+    stop("Some CMAQ cells could not be matched to pmgrid.")
+  }
+
+  setkey(pm_dt2, grid_id)
+
+  dt <- copy(weight_dt)
+  dt[, grid_id := pmgrid$grid_id[idx]]
+
+  setkey(dt, grid_id)
+  dt <- pm_dt2[dt]
+
+  dt[!is.finite(W_wind) | is.na(W_wind), W_wind := 0]
+  dt[W_wind < 0, W_wind := 0]
+
+  # Mass conservation within each CMAQ grid:
+  # mean(pm1 within grid_id) = pm12
+  dt[, W_mean_12km := mean(W_wind, na.rm = TRUE), by = grid_id]
+  dt[, weight_norm := (W_wind + eps) / (W_mean_12km + eps)]
+  dt[, pm1 := pm12 * weight_norm]
+
+  check <- dt[, .(
+    pm12 = unique(pm12)[1],
+    pm1_mean = mean(pm1, na.rm = TRUE),
+    diff = mean(pm1, na.rm = TRUE) - unique(pm12)[1]
+  ), by = grid_id]
+
+  max_error <- max(abs(check$diff), na.rm = TRUE)
+  msg("Max conservation error:", signif(max_error, 6))
+
+  pm_out <- dt[, .(
+    x, y,
+    grid_id,
+    pm12,
+    road,
+    road_upwind8,
+    windspeed,
+    speed_factor_beta,
+    W_wind,
+    W_mean_12km,
+    weight_norm,
+    pm1
+  )]
+
+  diag_out <- data.table(
+    n_grid = nrow(check),
+    max_abs_conservation_error = max_error,
+    pm1_min = min(pm_out$pm1, na.rm = TRUE),
+    pm1_mean = mean(pm_out$pm1, na.rm = TRUE),
+    pm1_max = max(pm_out$pm1, na.rm = TRUE),
+    W_min = min(pm_out$W_wind, na.rm = TRUE),
+    W_mean = mean(pm_out$W_wind, na.rm = TRUE),
+    W_max = max(pm_out$W_wind, na.rm = TRUE)
+  )
+
+  list(pm = pm_out, diag = diag_out)
+}
+
+save_fst_log <- function(dt, f) {
+  write_fst(dt, f)
+  msg("WROTE:", f, "| rows =", nrow(dt), "| size =", file.info(f)$size)
+}
+
+read_stack_years <- function(layer, years) {
+  files <- switch(
+    layer,
+    NRD = file.path(out_pm, sprintf("VA_1km_NRD_wind_%s_%d.fst", metric, years)),
+    ONR = file.path(out_pm, sprintf("VA_1km_ONR_wind_%s_%d.fst", metric, years)),
+    TOTAL = file.path(out_total, sprintf("VA_1km_TOTAL_wind_%s_%d.fst", metric, years))
+  )
+
+  lst <- lapply(seq_along(years), function(i) {
     f <- files[i]
-    if (!file.exists(f)) stop("Missing: ", f)
+    if (!file.exists(f)) stop("Missing file for panel: ", f)
+
     dt <- read_fst(f, as.data.table = TRUE)
     setDT(dt)
-    if (layer == "TOTAL") setnames(dt, "pm1_total", "val")
-    else setnames(dt, "pm1", "val")
+
+    if (layer == "TOTAL") {
+      setnames(dt, "pm1_total", "val")
+    } else {
+      setnames(dt, "pm1", "val")
+    }
+
     dt[, year := years[i]]
-    dt
+    dt[, .(x, y, val, year)]
   })
+
   rbindlist(lst, use.names = TRUE)
 }
 
-# ------------------------------------------------------------
-# Panel plot (optional)
-# ------------------------------------------------------------
-plot_panel_state <- function(stack_dt, out_pdf, state_abbr, p4s,
-                             facet_ncol = 5, legend_upper_q = 0.99) {
-
-  st_outline <- USAboundaries::us_states(resolution = "low")
-  st_outline <- st_outline[st_outline$state_abbr == state_abbr, ]
-  st_outline <- st_transform(st_as_sf(st_outline), st_crs(p4s))
+plot_panel_va <- function(stack_dt, out_pdf, title_text) {
+  va_sf <- get_va_boundary()
 
   stack_dt <- stack_dt[is.finite(val) & !is.na(val)]
   stack_dt[, year_f := factor(year, levels = sort(unique(year)))]
@@ -382,11 +372,13 @@ plot_panel_state <- function(stack_dt, out_pdf, state_abbr, p4s,
   ylim <- range(stack_dt$y, na.rm = TRUE)
 
   lim_upper <- as.numeric(quantile(stack_dt$val, legend_upper_q, na.rm = TRUE))
-  if (!is.finite(lim_upper) || lim_upper <= 0) lim_upper <- max(stack_dt$val, na.rm = TRUE)
+  if (!is.finite(lim_upper) || lim_upper <= 0) {
+    lim_upper <- max(stack_dt$val, na.rm = TRUE)
+  }
 
   p <- ggplot() +
     geom_raster(data = stack_dt, aes(x = x, y = y, fill = val)) +
-    geom_sf(data = st_outline, fill = NA, color = "grey35", linewidth = 0.2) +
+    geom_sf(data = va_sf, fill = NA, color = "grey35", linewidth = 0.2) +
     coord_sf(crs = st_crs(p4s), xlim = xlim, ylim = ylim, expand = FALSE) +
     facet_wrap(~ year_f, ncol = facet_ncol) +
     scale_fill_viridis_c(
@@ -395,162 +387,188 @@ plot_panel_state <- function(stack_dt, out_pdf, state_abbr, p4s,
       oob = scales::squish,
       na.value = "transparent"
     ) +
-    labs(x = NULL, y = NULL) +
+    labs(title = title_text, x = NULL, y = NULL) +
     theme_minimal(base_size = 12) +
     theme(
       panel.grid = element_blank(),
       axis.text  = element_blank(),
       axis.ticks = element_blank(),
       strip.text = element_text(size = 11, face = "bold"),
-      legend.position = "right"
+      legend.position = "right",
+      plot.title = element_text(size = 14, face = "bold")
     )
 
   grDevices::pdf(out_pdf, width = 16, height = 6.5, useDingbats = FALSE)
   print(p)
   grDevices::dev.off()
-  msg("WROTE: ", out_pdf, " | size=", file.info(out_pdf)$size)
+
+  msg("WROTE:", out_pdf, "| size =", file.info(out_pdf)$size)
 }
 
-# ============================================================
+# =========================================================
 # RUN
-# ============================================================
+# =========================================================
+msg("=== VA 2011-2020 wind-adjusted 1km downscaling ===")
+msg("beta_wind =", beta_wind, "| U0 =", U0)
+msg("Output root:", out_dir)
 
-msg("=== ", state_abbr, " | 1 km downscaling using r * U^{-1} * f(Δθ) | NORM ONLY ===")
-msg("Output root: ", out_dir)
+road_nrd_base <- load_roadiness(road_col_NRD)
+road_onr_base <- load_roadiness(road_col_ONR)
 
-# 1) Load roadiness grids
-road_nrd <- load_roadiness(road_col_NRD)
-road_onr <- load_roadiness(road_col_ONR)
+all_diag <- list()
 
-# 1.1) CRITICAL: clip to state boundary (make the grid truly state-only)
-road_nrd <- clip_points_to_state(road_nrd, state_abbr, p4s)
-road_onr <- clip_points_to_state(road_onr, state_abbr, p4s)
-
-# 1.2) Align NRD/ONR to the exact same (x,y) set
-setkey(road_nrd, x, y)
-setkey(road_onr, x, y)
-road_onr <- road_onr[road_nrd]   # keep only shared points
-road_nrd <- road_nrd[road_onr]   # symmetric (safety)
-
-if (nrow(road_nrd) == 0) stop("After clipping/alignment, 0 points remain. Check p4s and state boundary clip.")
-msg("Final 1 km grid points: ", nrow(road_nrd))
-
-# 2) Compute or load phi cache (use clipped grid!)
-phi_dt <- compute_or_load_phi(
-  road_xy_dt     = road_nrd[, .(x,y)],
-  roads_shp      = roads_shp,
-  p4s            = p4s,
-  phi_cache_fst  = phi_cache_fst,
-  chunk_size     = phi_chunk_size,
-  filter_expr    = roads_filter_expr
-)
-
-# 3) Attach phi to both NRD and ONR roadiness tables
-setkey(phi_dt, x, y)
-setkey(road_nrd, x, y)
-setkey(road_onr, x, y)
-
-road_nrd <- phi_dt[road_nrd]
-road_onr <- phi_dt[road_onr]
-
-if (any(!is.finite(road_nrd$phi))) stop("phi missing in road_nrd after merge.")
-if (any(!is.finite(road_onr$phi))) stop("phi missing in road_onr after merge.")
-
-msg("phi attached. NA count (NRD): ", sum(!is.finite(road_nrd$phi)))
-
-# 4) Build sf points once for CMAQ mapping
-road_sf_ref <- st_as_sf(road_nrd[, .(x,y)], coords = c("x","y"), crs = st_crs(p4s), remove = FALSE)
-
-# 5) Main loop over years
 for (yr in years) {
-  msg("\n-----------------------------")
-  msg("YEAR: ", yr, " | metric: ", metric)
-  msg("-----------------------------")
+  msg("--------------------------------------------------")
+  msg("YEAR:", yr)
+  msg("--------------------------------------------------")
 
-  # 5.1) Read annual CMAQ (12 km)
+  # -------------------------
+  # Read CMAQ annual fields
+  # -------------------------
   nrd12 <- read_annual_rds("NRD", metric, yr)
   onr12 <- read_annual_rds("ONR", metric, yr)
 
-  # 5.2) CMAQ mapping indices (based on NRD CMAQ grid)
-  mm     <- make_pmgrid_and_mapidx(nrd12, road_sf_ref, p4s)
+  # -------------------------
+  # Wind weights: NRD
+  # -------------------------
+  msg("NRD / gasoline wind weight ...")
+  nrd_wind_input <- extract_wind(road_nrd_base, yr)
+  nrd_weight <- make_wind_weight(nrd_wind_input)
+  nrd_weight[, sector := "NRD"]
+  nrd_weight[, year := yr]
+
+  f_nrd_w <- file.path(out_weight, sprintf("VA_1km_NRD_wind_weight_%s_%d.fst", metric, yr))
+  save_fst_log(nrd_weight, f_nrd_w)
+
+  # -------------------------
+  # Wind weights: ONR
+  # -------------------------
+  msg("ONR / diesel wind weight ...")
+  onr_wind_input <- extract_wind(road_onr_base, yr)
+  onr_weight <- make_wind_weight(onr_wind_input)
+  onr_weight[, sector := "ONR"]
+  onr_weight[, year := yr]
+
+  f_onr_w <- file.path(out_weight, sprintf("VA_1km_ONR_wind_weight_%s_%d.fst", metric, yr))
+  save_fst_log(onr_weight, f_onr_w)
+
+  # -------------------------
+  # CMAQ mapping
+  # Use NRD grid as reference; ONR should share same grid
+  # -------------------------
+  msg("Building CMAQ mapping ...")
+  mm <- make_pmgrid_and_mapidx(nrd12, road_nrd_base)
   pmgrid <- mm$pmgrid
-  idx    <- mm$idx
+  idx <- mm$idx
 
-  # 5.3) Wind extraction at 1 km grid (u/v -> U, theta)
-  wind_nrd <- extract_wind_uv_to_road(road_nrd[, .(x,y)], yr, p4s, eps)
-  wind_onr <- extract_wind_uv_to_road(road_onr[, .(x,y)], yr, p4s, eps)
+  # -------------------------
+  # Downscale NRD
+  # -------------------------
+  msg("Downscaling NRD / gasoline ...")
+  nrd_res <- downscale_with_weight(nrd12, pmgrid, idx, nrd_weight)
+  nrd1 <- nrd_res$pm
+  nrd1[, sector := "NRD"]
+  nrd1[, year := yr]
 
-  # 5.4) Build per-year road table inputs
-  road_nrd_year <- road_nrd[, .(x,y,road,phi)]
-  road_onr_year <- road_onr[, .(x,y,road,phi)]
+  f_nrd_pm <- file.path(out_pm, sprintf("VA_1km_NRD_wind_%s_%d.fst", metric, yr))
+  save_fst_log(nrd1, f_nrd_pm)
 
-  setkey(road_nrd_year, x, y)
-  setkey(road_onr_year, x, y)
-  setkey(wind_nrd, x, y)
-  setkey(wind_onr, x, y)
+  nrd_diag <- copy(nrd_res$diag)
+  nrd_diag[, sector := "NRD"]
+  nrd_diag[, year := yr]
 
-  road_nrd_year <- wind_nrd[road_nrd_year]
-  road_onr_year <- wind_onr[road_onr_year]
+  # -------------------------
+  # Downscale ONR
+  # -------------------------
+  msg("Downscaling ONR / diesel ...")
+  onr_res <- downscale_with_weight(onr12, pmgrid, idx, onr_weight)
+  onr1 <- onr_res$pm
+  onr1[, sector := "ONR"]
+  onr1[, year := yr]
 
-  if (any(!is.finite(road_nrd_year$U))) stop("Non-finite U in NRD wind extraction.")
-  if (any(!is.finite(road_nrd_year$theta))) stop("Non-finite theta in NRD wind extraction.")
+  f_onr_pm <- file.path(out_pm, sprintf("VA_1km_ONR_wind_%s_%d.fst", metric, yr))
+  save_fst_log(onr1, f_onr_pm)
 
-  # 5.5) Downscale using mean-conserving formula
-  nrd1 <- downscale_one_layer_formula(nrd12, pmgrid, idx, road_nrd_year, eps = eps, align_fun = align_fun)
-  onr1 <- downscale_one_layer_formula(onr12, pmgrid, idx, road_onr_year, eps = eps, align_fun = align_fun)
+  onr_diag <- copy(onr_res$diag)
+  onr_diag[, sector := "ONR"]
+  onr_diag[, year := yr]
 
-  # 5.6) Save NRD / ONR
-  f_nrd <- file.path(out_data, sprintf("%s_1km_NRD_%s_%d.fst", state_abbr, metric, yr))
-  f_onr <- file.path(out_data, sprintf("%s_1km_ONR_%s_%d.fst", state_abbr, metric, yr))
-  save_fst(nrd1, f_nrd)
-  save_fst(onr1, f_onr)
+  # -------------------------
+  # TOTAL = NRD + ONR
+  # -------------------------
+  msg("Creating TOTAL = NRD + ONR ...")
 
-  # 5.7) TOTAL = NRD + ONR
-  setkey(nrd1, x, y)
-  setkey(onr1, x, y)
-  tot1 <- nrd1[onr1]
-  tot1[, pm1_total := pm1 + i.pm1]
-  tot1 <- tot1[, .(x, y, pm1_total)]
+  nrd_tmp <- nrd1[, .(x, y, pm1_NRD = pm1)]
+  onr_tmp <- onr1[, .(x, y, pm1_ONR = pm1)]
 
-  f_tot <- file.path(out_data, sprintf("%s_1km_TOTAL_%s_%d.fst", state_abbr, metric, yr))
-  save_fst(tot1, f_tot)
+  setkey(nrd_tmp, x, y)
+  setkey(onr_tmp, x, y)
 
-  msg("Ranges (NRD pm1):   ", paste(range(nrd1$pm1, na.rm = TRUE), collapse = " ~ "))
-  msg("Ranges (ONR pm1):   ", paste(range(onr1$pm1, na.rm = TRUE), collapse = " ~ "))
-  msg("Ranges (TOTAL pm1): ", paste(range(tot1$pm1_total, na.rm = TRUE), collapse = " ~ "))
+  total1 <- nrd_tmp[onr_tmp]
+  total1[, pm1_total := pm1_NRD + pm1_ONR]
+  total1[, year := yr]
+  total1 <- total1[, .(x, y, pm1_NRD, pm1_ONR, pm1_total, year)]
 
-  rm(nrd12, onr12, mm, pmgrid, idx, wind_nrd, wind_onr,
-     road_nrd_year, road_onr_year, nrd1, onr1, tot1)
+  f_total <- file.path(out_total, sprintf("VA_1km_TOTAL_wind_%s_%d.fst", metric, yr))
+  save_fst_log(total1, f_total)
+
+  total_diag <- data.table(
+    sector = "TOTAL",
+    year = yr,
+    n_grid = NA_integer_,
+    max_abs_conservation_error = NA_real_,
+    pm1_min = min(total1$pm1_total, na.rm = TRUE),
+    pm1_mean = mean(total1$pm1_total, na.rm = TRUE),
+    pm1_max = max(total1$pm1_total, na.rm = TRUE),
+    W_min = NA_real_,
+    W_mean = NA_real_,
+    W_max = NA_real_
+  )
+
+  all_diag[[paste0("NRD_", yr)]] <- nrd_diag
+  all_diag[[paste0("ONR_", yr)]] <- onr_diag
+  all_diag[[paste0("TOTAL_", yr)]] <- total_diag
+
+  rm(nrd12, onr12, nrd_wind_input, onr_wind_input,
+     nrd_weight, onr_weight, nrd_res, onr_res,
+     nrd1, onr1, total1, mm, pmgrid, idx)
   gc()
 }
 
-# 6) Optional: panel maps (only if ALL needed files exist)
-if (isTRUE(make_panel_maps)) {
-  msg("\n=== MAKING PANEL MAPS (2011–2020) ===")
+# =========================================================
+# SAVE DIAGNOSTICS
+# =========================================================
+diag_dt <- rbindlist(all_diag, use.names = TRUE, fill = TRUE)
+diag_csv <- file.path(out_diag, "DIAGNOSTICS_wind_downscale_2011_2020.csv")
+fwrite(diag_dt, diag_csv)
+msg("WROTE:", diag_csv)
 
-  needed_nrd <- file.path(out_data, sprintf("%s_1km_NRD_%s_%d.fst", state_abbr, metric, years))
-  needed_onr <- file.path(out_data, sprintf("%s_1km_ONR_%s_%d.fst", state_abbr, metric, years))
-  needed_tot <- file.path(out_data, sprintf("%s_1km_TOTAL_%s_%d.fst", state_abbr, metric, years))
+# =========================================================
+# PANEL MAPS
+# =========================================================
+msg("Making panel maps ...")
 
-  if (!all(file.exists(c(needed_nrd, needed_onr, needed_tot)))) {
-    msg("Panel maps skipped: some yearly FST files are missing.")
-  } else {
-    stack_nrd <- read_stack_years("NRD", years, metric, out_data)
-    stack_onr <- read_stack_years("ONR", years, metric, out_data)
-    stack_tot <- read_stack_years("TOTAL", years, metric, out_data)
+stack_nrd <- read_stack_years("NRD", years)
+stack_onr <- read_stack_years("ONR", years)
+stack_tot <- read_stack_years("TOTAL", years)
 
-    pdf_nrd <- file.path(out_fig, sprintf("PANEL_%s_NRD_%s_2011_2020.pdf", state_abbr, metric))
-    pdf_onr <- file.path(out_fig, sprintf("PANEL_%s_ONR_%s_2011_2020.pdf", state_abbr, metric))
-    pdf_tot <- file.path(out_fig, sprintf("PANEL_%s_TOTAL_%s_2011_2020.pdf", state_abbr, metric))
+plot_panel_va(
+  stack_nrd,
+  file.path(out_fig, sprintf("PANEL_VA_NRD_gasoline_wind_%s_2011_2020.pdf", metric)),
+  "VA 1 km NRD / gasoline wind-adjusted PM2.5, 2011-2020"
+)
 
-    plot_panel_state(stack_nrd, pdf_nrd, state_abbr, p4s, facet_ncol, legend_upper_q)
-    plot_panel_state(stack_onr, pdf_onr, state_abbr, p4s, facet_ncol, legend_upper_q)
-    plot_panel_state(stack_tot, pdf_tot, state_abbr, p4s, facet_ncol, legend_upper_q)
+plot_panel_va(
+  stack_onr,
+  file.path(out_fig, sprintf("PANEL_VA_ONR_diesel_wind_%s_2011_2020.pdf", metric)),
+  "VA 1 km ONR / diesel wind-adjusted PM2.5, 2011-2020"
+)
 
-    rm(stack_nrd, stack_onr, stack_tot); gc()
-  }
-}
+plot_panel_va(
+  stack_tot,
+  file.path(out_fig, sprintf("PANEL_VA_TOTAL_wind_%s_2011_2020.pdf", metric)),
+  "VA 1 km TOTAL wind-adjusted PM2.5, 2011-2020"
+)
 
-msg("\nALL DONE ✅")
-msg("Final data (FST): ", out_data)
-msg("Panel maps (PDF): ", out_fig)
+msg("ALL DONE")
+msg("Output root:", out_dir)
