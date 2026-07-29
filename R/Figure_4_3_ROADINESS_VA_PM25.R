@@ -1,7 +1,7 @@
 #!/usr/bin/env Rscript
 
 # ==============================================================================
-# Figure 4-3
+# Figures 4-2 and 4-3 -- final combined renderer
 # Roadiness-based 1-km redistribution of gasoline- and diesel-attributable
 # CMAQ-ISAM PM2.5 in Virginia, averaged over 2011-2020
 #
@@ -15,13 +15,16 @@
 #   - Length-based roadiness is used because the manuscript defines roadiness
 #     using road length and inverse-distance weighting, rather than segment count.
 #
-# Main figure:
+# Both figures use the same six-panel order:
 #   (a) Gasoline: native 12-km CMAQ concentration
 #   (b) Gasoline: roadiness-downscaled 1-km concentration
 #   (c) Gasoline: 1-km minus native-parent concentration
 #   (d) Diesel:   native 12-km CMAQ concentration
 #   (e) Diesel:   roadiness-downscaled 1-km concentration
 #   (f) Diesel:   1-km minus native-parent concentration
+#
+# Figure 4-2 shows the full Virginia domain.
+# Figure 4-3 shows the Northern Virginia detail window.
 #
 # The native 12-km values are repeated over their assigned 1-km child cells only
 # for visual comparison. Downscaling preserves the mean concentration among the
@@ -35,12 +38,16 @@
 #   /scratch/xshan2/R_Code/disperseR/Auto/roadiness_2017/VA/
 #       roadiness_1km_hw_loc_VA.fst
 #
-# OUTPUTS:
-#   Figure_4_3_roadiness_VA_2011_2020.pdf
-#   Figure_4_3_roadiness_VA_2011_2020.png
-#   Figure_4_3_QC_summary.csv
-#   Figure_4_3_parent_QC.csv
-#   Figure_4_3_plot_data.rds
+# FIGURE OUTPUTS:
+#   Figure_4_2_roadiness_VA_full_2011_2020.pdf
+#   Figure_4_2_roadiness_VA_full_2011_2020.png
+#   Figure_4_3_roadiness_NOVA_zoom_2011_2020.pdf
+#   Figure_4_3_roadiness_NOVA_zoom_2011_2020.png
+#
+# SHARED DATA AND QC OUTPUTS:
+#   Roadiness_QC_summary.csv
+#   Roadiness_parent_QC.csv
+#   Roadiness_plot_data.rds
 #   VA_1km_gasoline_roadiness_2011_2020_mean.fst
 #   VA_1km_diesel_roadiness_2011_2020_mean.fst
 #
@@ -99,7 +106,7 @@ roadiness_file <- paste0(
 
 out_dir <- file.path(
   cmaq_dir,
-  "FIGURE_4_3_ROADINESS"
+  "FIGURES_4_2_4_3_ROADINESS_VA_AND_NOVA"
 )
 
 dir.create(
@@ -108,29 +115,44 @@ dir.create(
   showWarnings = FALSE
 )
 
-pdf_file <- file.path(
+statewide_pdf_file <- file.path(
   out_dir,
-  "Figure_4_3_roadiness_VA_2011_2020.pdf"
+  "Figure_4_2_roadiness_VA_full_2011_2020.pdf"
 )
 
-png_file <- file.path(
+statewide_png_file <- file.path(
   out_dir,
-  "Figure_4_3_roadiness_VA_2011_2020.png"
+  "Figure_4_2_roadiness_VA_full_2011_2020.png"
 )
+
+nova_pdf_file <- file.path(
+  out_dir,
+  "Figure_4_3_roadiness_NOVA_zoom_2011_2020.pdf"
+)
+
+nova_png_file <- file.path(
+  out_dir,
+  "Figure_4_3_roadiness_NOVA_zoom_2011_2020.png"
+)
+
+# The legacy renderer helpers below use pdf_file and png_file as the active
+# output targets. Start with Figure 4-3, then switch them to Figure 4-2 later.
+pdf_file <- nova_pdf_file
+png_file <- nova_png_file
 
 summary_qc_file <- file.path(
   out_dir,
-  "Figure_4_3_QC_summary.csv"
+  "Roadiness_QC_summary.csv"
 )
 
 parent_qc_file <- file.path(
   out_dir,
-  "Figure_4_3_parent_QC.csv"
+  "Roadiness_parent_QC.csv"
 )
 
 plot_data_file <- file.path(
   out_dir,
-  "Figure_4_3_plot_data.rds"
+  "Roadiness_plot_data.rds"
 )
 
 gasoline_output_file <- file.path(
@@ -169,9 +191,17 @@ if (length(missing_inputs) > 0) {
 absolute_upper_limit_fixed <- 1.0
 difference_upper_quantile <- 0.995
 
-fig_width_in <- 12.2
-fig_height_in <- 6.75
+# Separate dimensions let the full-state and zoomed figures fill their panels.
+# PDFs remain vector originals; 600-dpi PNGs are intended for insertion in Word.
+statewide_width_in <- 14.4
+statewide_height_in <- 8.0
+nova_width_in <- 14.4
+nova_height_in <- 8.8
 png_dpi <- 600
+
+# Active dimensions for the first-rendered Northern Virginia figure.
+fig_width_in <- nova_width_in
+fig_height_in <- nova_height_in
 
 # Numerical tolerance used only for QC
 small_value <- 1e-12
@@ -1007,7 +1037,7 @@ saveRDS(
 
 cat(
   "\n========================================\n",
-  "FIGURE 4-3 QC SUMMARY\n",
+  "SHARED FIGURES 4-2 AND 4-3 QC SUMMARY\n",
   "========================================\n"
 )
 
@@ -1024,7 +1054,7 @@ absolute_values <- c(
   plot_data$pm1
 )
 
-# Fixed common absolute-concentration scale requested for Figure 4-3.
+# Fixed common absolute-concentration scale used in both figures.
 absolute_upper_limit <- absolute_upper_limit_fixed
 absolute_breaks <- seq(
   0,
@@ -1111,29 +1141,71 @@ cat(
   sep = ""
 )
 
-# Virginia map window in the native 1-km projected CRS.
-va_bbox_lcc <- st_bbox(
-  virginia_lcc
+# Common Northern Virginia zoom window for all six panels. Keeping the extent
+# in longitude/latitude makes the selected section transparent and easy to
+# change if a different Virginia subregion is requested later.
+#
+# Current window: Northern Virginia, including the Fairfax-Arlington-Prince
+# William-Loudoun corridor and its immediate surroundings.
+zoom_bbox_ll <- st_bbox(
+  c(
+    xmin = -78.25,
+    ymin = 38.25,
+    xmax = -76.80,
+    ymax = 39.50
+  ),
+  crs = st_crs(
+    4326
+  )
 )
 
-map_padding_m <- 10000
-
-va_xlim <- c(
-  as.numeric(
-    va_bbox_lcc["xmin"]
-  ) - map_padding_m,
-  as.numeric(
-    va_bbox_lcc["xmax"]
-  ) + map_padding_m
+zoom_bbox_lcc <- st_bbox(
+  st_transform(
+    st_as_sfc(
+      zoom_bbox_ll
+    ),
+    st_crs(
+      virginia_lcc
+    )
+  )
 )
 
-va_ylim <- c(
+zoom_padding_m <- 2500
+
+nova_map_xlim <- c(
   as.numeric(
-    va_bbox_lcc["ymin"]
-  ) - map_padding_m,
+    zoom_bbox_lcc["xmin"]
+  ) - zoom_padding_m,
   as.numeric(
-    va_bbox_lcc["ymax"]
-  ) + map_padding_m
+    zoom_bbox_lcc["xmax"]
+  ) + zoom_padding_m
+)
+
+nova_map_ylim <- c(
+  as.numeric(
+    zoom_bbox_lcc["ymin"]
+  ) - zoom_padding_m,
+  as.numeric(
+    zoom_bbox_lcc["ymax"]
+  ) + zoom_padding_m
+)
+
+# Active map bounds used by the existing panel-building calls.
+map_xlim <- nova_map_xlim
+map_ylim <- nova_map_ylim
+
+cat(
+  "\nFigure zoom window (longitude/latitude):\n",
+  "  xmin = ",
+  zoom_bbox_ll["xmin"],
+  "\n  ymin = ",
+  zoom_bbox_ll["ymin"],
+  "\n  xmax = ",
+  zoom_bbox_ll["xmax"],
+  "\n  ymax = ",
+  zoom_bbox_ll["ymax"],
+  "\n",
+  sep = ""
 )
 
 # ------------------------------------------------------------------------------
@@ -1143,6 +1215,8 @@ va_ylim <- c(
 make_absolute_panel <- function(
     data,
     value_column,
+    map_xlim_use = map_xlim,
+    map_ylim_use = map_ylim,
     show_legend = FALSE) {
 
   panel_dt <- copy(
@@ -1173,13 +1247,13 @@ make_absolute_panel <- function(
       inherit.aes = FALSE,
       fill = NA,
       color = "grey25",
-      linewidth = 0.34
+      linewidth = 0.52
     ) +
 
     coord_sf(
       crs = st_crs(p4s),
-      xlim = va_xlim,
-      ylim = va_ylim,
+      xlim = map_xlim_use,
+      ylim = map_ylim_use,
       expand = FALSE,
       datum = NA,
       clip = "on"
@@ -1208,11 +1282,11 @@ make_absolute_panel <- function(
         title.hjust = 0.5,
         label.position = "bottom",
         barwidth = grid::unit(
-          80,
+          92,
           "mm"
         ),
         barheight = grid::unit(
-          4.0,
+          4.6,
           "mm"
         ),
         frame.colour = "grey35",
@@ -1245,7 +1319,7 @@ make_absolute_panel <- function(
       panel.border = element_rect(
         fill = NA,
         color = "grey38",
-        linewidth = 0.30
+        linewidth = 0.42
       ),
 
       legend.position = if (
@@ -1259,11 +1333,11 @@ make_absolute_panel <- function(
       legend.justification = "center",
 
       legend.title = element_text(
-        size = 9.1
+        size = 12.0
       ),
 
       legend.text = element_text(
-        size = 8.3
+        size = 10.5
       ),
 
       legend.margin = margin(
@@ -1281,10 +1355,10 @@ make_absolute_panel <- function(
       ),
 
       plot.margin = margin(
-        1,
-        4,
+        2,
         3,
-        4,
+        3,
+        3,
         unit = "pt"
       )
     )
@@ -1292,6 +1366,8 @@ make_absolute_panel <- function(
 
 make_difference_panel <- function(
     data,
+    map_xlim_use = map_xlim,
+    map_ylim_use = map_ylim,
     show_legend = FALSE) {
 
   ggplot() +
@@ -1311,13 +1387,13 @@ make_difference_panel <- function(
       inherit.aes = FALSE,
       fill = NA,
       color = "grey25",
-      linewidth = 0.34
+      linewidth = 0.52
     ) +
 
     coord_sf(
       crs = st_crs(p4s),
-      xlim = va_xlim,
-      ylim = va_ylim,
+      xlim = map_xlim_use,
+      ylim = map_ylim_use,
       expand = FALSE,
       datum = NA,
       clip = "on"
@@ -1348,11 +1424,11 @@ make_difference_panel <- function(
         title.hjust = 0.5,
         label.position = "bottom",
         barwidth = grid::unit(
-          46,
+          56,
           "mm"
         ),
         barheight = grid::unit(
-          4.0,
+          4.6,
           "mm"
         ),
         frame.colour = "grey35",
@@ -1385,7 +1461,7 @@ make_difference_panel <- function(
       panel.border = element_rect(
         fill = NA,
         color = "grey38",
-        linewidth = 0.30
+        linewidth = 0.42
       ),
 
       legend.position = if (
@@ -1399,11 +1475,11 @@ make_difference_panel <- function(
       legend.justification = "center",
 
       legend.title = element_text(
-        size = 9.1
+        size = 12.0
       ),
 
       legend.text = element_text(
-        size = 8.3
+        size = 10.5
       ),
 
       legend.margin = margin(
@@ -1421,10 +1497,10 @@ make_difference_panel <- function(
       ),
 
       plot.margin = margin(
-        1,
-        4,
+        2,
         3,
-        4,
+        3,
+        3,
         unit = "pt"
       )
     )
@@ -1576,15 +1652,29 @@ draw_figure <- function() {
   grid::grid.newpage()
 
   outer_layout <- grid::grid.layout(
-    nrow = 3,
-    ncol = 3,
-    widths = grid::unit(
-      c(
+    nrow = 4,
+    ncol = 5,
+    widths = grid::unit.c(
+      grid::unit(
         1,
-        1,
-        1
+        "null"
       ),
-      "null"
+      grid::unit(
+        0.14,
+        "in"
+      ),
+      grid::unit(
+        1,
+        "null"
+      ),
+      grid::unit(
+        0.14,
+        "in"
+      ),
+      grid::unit(
+        1,
+        "null"
+      )
     ),
     heights = grid::unit.c(
       grid::unit(
@@ -1592,11 +1682,15 @@ draw_figure <- function() {
         "null"
       ),
       grid::unit(
+        0.13,
+        "in"
+      ),
+      grid::unit(
         1,
         "null"
       ),
       grid::unit(
-        0.67,
+        0.84,
         "in"
       )
     )
@@ -1626,7 +1720,7 @@ draw_figure <- function() {
       ncol = 1,
       heights = grid::unit.c(
         grid::unit(
-          0.19,
+          0.27,
           "in"
         ),
         grid::unit(
@@ -1652,7 +1746,7 @@ draw_figure <- function() {
     grid::grid.text(
       label = tag,
       x = grid::unit(
-        1.5,
+        2.0,
         "mm"
       ),
       y = grid::unit(
@@ -1666,7 +1760,7 @@ draw_figure <- function() {
       gp = grid::gpar(
         fontfamily = "sans",
         fontface = "bold",
-        fontsize = 10.5
+        fontsize = 15.0
       )
     )
 
@@ -1699,42 +1793,42 @@ draw_figure <- function() {
     g_b,
     "(b)",
     1,
-    2
+    3
   )
 
   draw_panel_with_tag(
     g_c,
     "(c)",
     1,
-    3
+    5
   )
 
   draw_panel_with_tag(
     g_d,
     "(d)",
-    2,
+    3,
     1
   )
 
   draw_panel_with_tag(
     g_e,
     "(e)",
-    2,
-    2
+    3,
+    3
   )
 
   draw_panel_with_tag(
     g_f,
     "(f)",
-    2,
-    3
+    3,
+    5
   )
 
   # Shared absolute concentration legend under columns 1-2
   grid::pushViewport(
     grid::viewport(
-      layout.pos.row = 3,
-      layout.pos.col = 1:2
+      layout.pos.row = 4,
+      layout.pos.col = 1:3
     )
   )
 
@@ -1747,8 +1841,8 @@ draw_figure <- function() {
   # Shared difference legend under column 3
   grid::pushViewport(
     grid::viewport(
-      layout.pos.row = 3,
-      layout.pos.col = 3
+      layout.pos.row = 4,
+      layout.pos.col = 5
     )
   )
 
@@ -1827,6 +1921,201 @@ cat(
   " MB\n",
   sep = ""
 )
+
+# ------------------------------------------------------------------------------
+# 12A. Save the full-Virginia PDF before attempting either PNG
+# ------------------------------------------------------------------------------
+#
+# The earlier combined script attempted the Northern Virginia PNG before it
+# reached the full-state PDF section. A missing headless PNG renderer therefore
+# stopped the script with only the NOVA PDF on disk. The full-state vector PDF
+# is now created and verified here, before any PNG work begins.
+
+nova_map_xlim_saved <- map_xlim
+nova_map_ylim_saved <- map_ylim
+
+va_bbox_lcc_early <- st_bbox(
+  virginia_lcc
+)
+
+statewide_padding_m_early <- 10000
+
+map_xlim <- c(
+  as.numeric(
+    va_bbox_lcc_early["xmin"]
+  ) - statewide_padding_m_early,
+  as.numeric(
+    va_bbox_lcc_early["xmax"]
+  ) + statewide_padding_m_early
+)
+
+map_ylim <- c(
+  as.numeric(
+    va_bbox_lcc_early["ymin"]
+  ) - statewide_padding_m_early,
+  as.numeric(
+    va_bbox_lcc_early["ymax"]
+  ) + statewide_padding_m_early
+)
+
+rebuild_active_figure_grobs <- function() {
+
+  p_a <<- make_absolute_panel(
+    data = gasoline_plot_data,
+    value_column = "pm12",
+    show_legend = FALSE
+  )
+
+  p_b <<- make_absolute_panel(
+    data = gasoline_plot_data,
+    value_column = "pm1",
+    show_legend = FALSE
+  )
+
+  p_c <<- make_difference_panel(
+    data = gasoline_plot_data,
+    show_legend = FALSE
+  )
+
+  p_d <<- make_absolute_panel(
+    data = diesel_plot_data,
+    value_column = "pm12",
+    show_legend = FALSE
+  )
+
+  p_e <<- make_absolute_panel(
+    data = diesel_plot_data,
+    value_column = "pm1",
+    show_legend = FALSE
+  )
+
+  p_f <<- make_difference_panel(
+    data = diesel_plot_data,
+    show_legend = FALSE
+  )
+
+  p_absolute_legend <<- make_absolute_panel(
+    data = gasoline_plot_data,
+    value_column = "pm1",
+    show_legend = TRUE
+  ) +
+    theme(
+      panel.border = element_blank()
+    )
+
+  p_difference_legend <<- make_difference_panel(
+    data = gasoline_plot_data,
+    show_legend = TRUE
+  ) +
+    theme(
+      panel.border = element_blank()
+    )
+
+  absolute_legend_grob <<- get_legend(
+    p_absolute_legend
+  )
+
+  difference_legend_grob <<- get_legend(
+    p_difference_legend
+  )
+
+  g_a <<- ggplotGrob(
+    p_a
+  )
+
+  g_b <<- ggplotGrob(
+    p_b
+  )
+
+  g_c <<- ggplotGrob(
+    p_c
+  )
+
+  g_d <<- ggplotGrob(
+    p_d
+  )
+
+  g_e <<- ggplotGrob(
+    p_e
+  )
+
+  g_f <<- ggplotGrob(
+    p_f
+  )
+
+  invisible(
+    NULL
+  )
+}
+
+rebuild_active_figure_grobs()
+
+unlink(
+  statewide_pdf_file,
+  force = TRUE
+)
+
+grDevices::pdf(
+  file = statewide_pdf_file,
+  width = statewide_width_in,
+  height = statewide_height_in,
+  onefile = FALSE,
+  useDingbats = FALSE,
+  paper = "special",
+  bg = "white",
+  family = "Helvetica"
+)
+
+draw_figure()
+
+invisible(
+  grDevices::dev.off()
+)
+
+Sys.sleep(
+  1
+)
+
+if (
+  !file.exists(
+    statewide_pdf_file
+  ) ||
+    !is.finite(
+      file.info(
+        statewide_pdf_file
+      )$size
+    ) ||
+    file.info(
+      statewide_pdf_file
+    )$size <= 1000
+) {
+  stop(
+    "Figure 4-2 full-Virginia PDF creation failed:\n",
+    statewide_pdf_file
+  )
+}
+
+cat(
+  "\nFigure 4-2 full-Virginia vector PDF created before PNG rendering:\n",
+  statewide_pdf_file,
+  "\nSize: ",
+  round(
+    file.info(
+      statewide_pdf_file
+    )$size /
+      1024^2,
+    3
+  ),
+  " MB\n",
+  sep = ""
+)
+
+# Restore and rebuild the NOVA grobs so the next section creates the correct
+# Figure 4-3 PNG rather than accidentally rasterizing the statewide map.
+map_xlim <- nova_map_xlim_saved
+map_ylim <- nova_map_ylim_saved
+
+rebuild_active_figure_grobs()
 
 # ------------------------------------------------------------------------------
 # 13. Hopper-safe PNG creation with independent fallbacks
@@ -2596,6 +2885,7 @@ if (
 expected_outputs <- c(
   pdf_file,
   png_file,
+  statewide_pdf_file,
   summary_qc_file,
   parent_qc_file,
   plot_data_file,
@@ -2680,6 +2970,542 @@ print(
 
 cat(
   "\nOutput directory:\n",
+  out_dir,
+  "\n",
+  sep = ""
+)
+
+# ==============================================================================
+# 15. Figure 4-2: full Virginia domain
+# ==============================================================================
+#
+# The calculation, scales, panel order, and legend breaks are identical to
+# Figure 4-3. Only the map extent and output canvas height change. Reusing the
+# already validated plot_data prevents the statewide and zoom figures from
+# diverging because of separate calculations.
+
+nova_pdf_file <- pdf_file
+nova_png_file <- png_file
+nova_png_method <- png_method
+
+statewide_pdf_file <- file.path(
+  out_dir,
+  "Figure_4_2_roadiness_VA_full_2011_2020.pdf"
+)
+
+statewide_png_file <- file.path(
+  out_dir,
+  "Figure_4_2_roadiness_VA_full_2011_2020.png"
+)
+
+va_bbox_lcc <- st_bbox(
+  virginia_lcc
+)
+
+statewide_padding_m <- 10000
+
+map_xlim <- c(
+  as.numeric(
+    va_bbox_lcc["xmin"]
+  ) - statewide_padding_m,
+  as.numeric(
+    va_bbox_lcc["xmax"]
+  ) + statewide_padding_m
+)
+
+map_ylim <- c(
+  as.numeric(
+    va_bbox_lcc["ymin"]
+  ) - statewide_padding_m,
+  as.numeric(
+    va_bbox_lcc["ymax"]
+  ) + statewide_padding_m
+)
+
+cat(
+  "\nRebuilding the same six panels for the full Virginia domain.\n"
+)
+
+# Rebuild all six panels after changing map_xlim and map_ylim. The plotting
+# functions evaluate these bounds when each ggplot object is created.
+p_a <- make_absolute_panel(
+  data = gasoline_plot_data,
+  value_column = "pm12",
+  show_legend = FALSE
+)
+
+p_b <- make_absolute_panel(
+  data = gasoline_plot_data,
+  value_column = "pm1",
+  show_legend = FALSE
+)
+
+p_c <- make_difference_panel(
+  data = gasoline_plot_data,
+  show_legend = FALSE
+)
+
+p_d <- make_absolute_panel(
+  data = diesel_plot_data,
+  value_column = "pm12",
+  show_legend = FALSE
+)
+
+p_e <- make_absolute_panel(
+  data = diesel_plot_data,
+  value_column = "pm1",
+  show_legend = FALSE
+)
+
+p_f <- make_difference_panel(
+  data = diesel_plot_data,
+  show_legend = FALSE
+)
+
+p_absolute_legend <- make_absolute_panel(
+  data = gasoline_plot_data,
+  value_column = "pm1",
+  show_legend = TRUE
+) +
+  theme(
+    panel.border = element_blank()
+  )
+
+p_difference_legend <- make_difference_panel(
+  data = gasoline_plot_data,
+  show_legend = TRUE
+) +
+  theme(
+    panel.border = element_blank()
+  )
+
+absolute_legend_grob <- get_legend(
+  p_absolute_legend
+)
+
+difference_legend_grob <- get_legend(
+  p_difference_legend
+)
+
+g_a <- ggplotGrob(
+  p_a
+)
+
+g_b <- ggplotGrob(
+  p_b
+)
+
+g_c <- ggplotGrob(
+  p_c
+)
+
+g_d <- ggplotGrob(
+  p_d
+)
+
+g_e <- ggplotGrob(
+  p_e
+)
+
+g_f <- ggplotGrob(
+  p_f
+)
+
+# The statewide maps are wider than the Northern Virginia window. A slightly
+# shorter canvas lets the Virginia boundary fill the panels without creating
+# unnecessary vertical white space.
+pdf_file <- statewide_pdf_file
+png_file <- statewide_png_file
+fig_width_in <- 14.4
+fig_height_in <- 8.0
+
+unlink(
+  c(
+    pdf_file,
+    png_file
+  ),
+  force = TRUE
+)
+
+grDevices::pdf(
+  file = pdf_file,
+  width = fig_width_in,
+  height = fig_height_in,
+  onefile = FALSE,
+  useDingbats = FALSE,
+  paper = "special",
+  bg = "white",
+  family = "Helvetica"
+)
+
+draw_figure()
+
+invisible(
+  grDevices::dev.off()
+)
+
+Sys.sleep(
+  1
+)
+
+if (
+  !file.exists(
+    pdf_file
+  ) ||
+    !is.finite(
+      file.info(
+        pdf_file
+      )$size
+    ) ||
+    file.info(
+      pdf_file
+    )$size <= 1000
+) {
+  stop(
+    "Figure 4-2 vector PDF creation failed:\n",
+    pdf_file
+  )
+}
+
+cat(
+  "\nFigure 4-2 vector PDF created:\n",
+  pdf_file,
+  "\nSize: ",
+  round(
+    file.info(
+      pdf_file
+    )$size /
+      1024^2,
+    3
+  ),
+  " MB\n",
+  sep = ""
+)
+
+# Reuse the tested Hopper-safe device helpers from Figure 4-3.
+statewide_png_method <- NA_character_
+
+if (
+  isTRUE(
+    capabilities(
+      "cairo"
+    )
+  )
+) {
+
+  ok <- try_png_device(
+    "Figure 4-2 base grDevices::png(type='cairo-png')",
+    function() {
+
+      grDevices::png(
+        filename = png_file,
+        width = as.integer(
+          round(
+            fig_width_in *
+              png_dpi
+          )
+        ),
+        height = as.integer(
+          round(
+            fig_height_in *
+              png_dpi
+          )
+        ),
+        units = "px",
+        res = png_dpi,
+        type = "cairo-png",
+        bg = "white",
+        pointsize = 12
+      )
+    }
+  )
+
+  if (
+    ok
+  ) {
+    statewide_png_method <- "base cairo-png"
+  }
+}
+
+if (
+  is.na(
+    statewide_png_method
+  ) &&
+    requireNamespace(
+      "ragg",
+      quietly = TRUE
+    )
+) {
+
+  ok <- try_png_device(
+    "Figure 4-2 ragg::agg_png",
+    function() {
+
+      ragg::agg_png(
+        filename = png_file,
+        width = fig_width_in,
+        height = fig_height_in,
+        units = "in",
+        res = png_dpi,
+        background = "white"
+      )
+    }
+  )
+
+  if (
+    ok
+  ) {
+    statewide_png_method <- "ragg"
+  }
+}
+
+if (
+  is.na(
+    statewide_png_method
+  ) &&
+    requireNamespace(
+      "Cairo",
+      quietly = TRUE
+    )
+) {
+
+  ok <- try_png_device(
+    "Figure 4-2 Cairo::CairoPNG",
+    function() {
+
+      Cairo::CairoPNG(
+        filename = png_file,
+        width = as.integer(
+          round(
+            fig_width_in *
+              png_dpi
+          )
+        ),
+        height = as.integer(
+          round(
+            fig_height_in *
+              png_dpi
+          )
+        ),
+        unit = "px",
+        pointsize = 12,
+        bg = "white",
+        res = png_dpi
+      )
+    }
+  )
+
+  if (
+    ok
+  ) {
+    statewide_png_method <- "Cairo package"
+  }
+}
+
+if (
+  is.na(
+    statewide_png_method
+  )
+) {
+
+  ok <- try_png_device(
+    "Figure 4-2 grDevices::bitmap(type='png16m')",
+    function() {
+
+      grDevices::bitmap(
+        file = png_file,
+        type = "png16m",
+        width = fig_width_in,
+        height = fig_height_in,
+        res = png_dpi,
+        pointsize = 12
+      )
+    }
+  )
+
+  if (
+    ok
+  ) {
+    statewide_png_method <- "base bitmap / Ghostscript"
+  }
+}
+
+# Conversion from the vector PDF is retained as a fallback when no direct
+# headless PNG device is available in the Hopper R installation.
+if (
+  is.na(
+    statewide_png_method
+  )
+) {
+
+  pdftocairo_bin <- find_existing_command(
+    "pdftocairo",
+    c(
+      "/usr/bin/pdftocairo",
+      "/bin/pdftocairo"
+    )
+  )
+
+  if (
+    length(
+      pdftocairo_bin
+    ) == 1 &&
+      !is.na(
+        pdftocairo_bin
+      )
+  ) {
+
+    output_prefix <- tools::file_path_sans_ext(
+      png_file
+    )
+
+    ok <- run_external(
+      command = pdftocairo_bin,
+      args = c(
+        "-png",
+        "-singlefile",
+        "-r",
+        as.character(
+          png_dpi
+        ),
+        pdf_file,
+        output_prefix
+      ),
+      method_name = "Figure 4-2 pdftocairo"
+    )
+
+    if (
+      ok
+    ) {
+      statewide_png_method <- "pdftocairo"
+    }
+  }
+}
+
+if (
+  is.na(
+    statewide_png_method
+  )
+) {
+
+  gs_bin <- find_existing_command(
+    "gs",
+    c(
+      "/usr/bin/gs",
+      "/bin/gs",
+      Sys.getenv(
+        "R_GSCMD"
+      )
+    )
+  )
+
+  if (
+    length(
+      gs_bin
+    ) == 1 &&
+      !is.na(
+        gs_bin
+      )
+  ) {
+
+    ok <- run_external(
+      command = gs_bin,
+      args = c(
+        "-dSAFER",
+        "-dBATCH",
+        "-dNOPAUSE",
+        "-sDEVICE=png16m",
+        paste0(
+          "-r",
+          png_dpi
+        ),
+        "-dTextAlphaBits=4",
+        "-dGraphicsAlphaBits=4",
+        paste0(
+          "-sOutputFile=",
+          png_file
+        ),
+        pdf_file
+      ),
+      method_name = "Figure 4-2 Ghostscript"
+    )
+
+    if (
+      ok
+    ) {
+      statewide_png_method <- "Ghostscript"
+    }
+  }
+}
+
+if (
+  is.na(
+    statewide_png_method
+  ) ||
+    !png_is_valid(
+      png_file
+    )
+) {
+  stop(
+    "Figure 4-2 vector PDF was created, but the 600-dpi PNG could not be ",
+    "created by any available Hopper renderer.\nPDF:\n",
+    pdf_file
+  )
+}
+
+combined_figure_outputs <- c(
+  statewide_pdf_file,
+  statewide_png_file,
+  nova_pdf_file,
+  nova_png_file
+)
+
+missing_figure_outputs <- combined_figure_outputs[
+  !file.exists(
+    combined_figure_outputs
+  ) |
+    !is.finite(
+      file.info(
+        combined_figure_outputs
+      )$size
+    ) |
+    file.info(
+      combined_figure_outputs
+    )$size <= 1000
+]
+
+if (
+  length(
+    missing_figure_outputs
+  ) > 0
+) {
+  stop(
+    "One or more final figure files are missing or too small:\n",
+    paste(
+      missing_figure_outputs,
+      collapse = "\n"
+    )
+  )
+}
+
+cat(
+  "\n========================================\n",
+  "FIGURES 4-2 AND 4-3 COMPLETED SUCCESSFULLY\n",
+  "========================================\n",
+  "Figure 4-2 domain: Full Virginia\n",
+  "Figure 4-3 domain: Northern Virginia zoom\n",
+  "Figure 4-2 PNG method: ",
+  statewide_png_method,
+  "\nFigure 4-3 PNG method: ",
+  nova_png_method,
+  "\nResolution: ",
+  png_dpi,
+  " dpi\n\nFinal figure files:\n",
+  paste(
+    combined_figure_outputs,
+    collapse = "\n"
+  ),
+  "\n\nShared QC/data directory:\n",
   out_dir,
   "\n",
   sep = ""
